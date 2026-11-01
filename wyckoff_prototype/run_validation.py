@@ -1,0 +1,180 @@
+# -*- coding: utf-8 -*-
+"""
+台股 CSV 驗證腳本（StockExpert 威科夫模組）
+==========================================
+
+用法：
+    python3 run_validation.py data/*.csv --out results
+    python3 run_validation.py data/2330.csv --index data/TAIEX.csv --out results
+    python3 run_validation.py data/2330.csv --trades my_trades.csv --out results
+
+輸入：
+  - 日 K CSV：欄位可為英文（Date/Open/High/Low/Close/Volume[/Adj Close]）或中文
+    （日期/開盤價/最高價/最低價/收盤價/成交股數…），支援民國年與千分位；
+    建議使用「還原權值」價格，避免除權息缺口被誤判為 SOW/破冰。
+  - --index：大盤（加權指數）CSV，用於原書的相對強弱選股〔p253-258〕。
+  - --trades：使用者買賣紀錄（欄位 date, side, price[, symbol]），輸出決策檢討。
+
+輸出（每檔一個資料夾）：
+  events.csv / signals.csv / trs.csv / bars.csv / trades.csv / event_study.csv / card.json
+  以及總表 summary.md：各訊號的交易統計、與「隨機進場＋相同出場規則」基準的比較。
+
+方法學（避免自我欺騙）：
+  - 所有事件以「確認K線」產生，回測於下一根開盤進場（無未來函數）。
+  - 交易成本：買 0.1425%、賣 0.4425%（含 0.3% 證交稅）。
+  - 基準：同一檔股票、相同停損距離（以 ATR 計）與相同出場規則的隨機進場，重複 200 次。
+  - 參數應以前段樣本校準、後段樣本驗證（--split 2018-01-01 會分段輸出）。
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import math
+import os
+
+import numpy as np
+import pandas as pd
+
+from wyckoff_engine import (Params, WyckoffScanner, backtest, summarize_trades, event_study,
+                            snapshot, audit_trades, load_ohlcv_csv)
+
+
+def to_md(df: pd.DataFrame, index: bool = True) -> str:
+    """不依賴 tabulate 的簡易 Markdown 表格。"""
+    d = df.reset_index() if index else df
+    cols = [str(c) for c in d.columns]
+    fmt = lambda x: f"{x:.4f}" if isinstance(x, (float, np.floating)) else str(x)
+    rows = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
+    rows += ["| " + " | ".join(fmt(x) for x in r) + " |" for r in d.itertuples(index=False)]
+    return "\n".join(rows)
+
+
+def random_baseline(sc: WyckoffScanner, n_trades: int, stop_atr: float, reps: int = 200, seed: int = 0) -> dict:
+    """隨機進場基準：與策略相同的出場規則，只把進場點換成隨機。"""
+    rng = np.random.default_rng(seed)
+    d = sc.d
+    valid = np.where(d["atr"].notna().to_numpy() & (np.arange(len(d)) > 60) & (np.arange(len(d)) < len(d) - 10))[0]
+    if n_trades == 0 or len(valid) < n_trades:
+        return {}
+    exp = []
+    orig = sc.signals
+    for _ in range(reps):
+        picks = np.sort(rng.choice(valid, size=n_trades, replace=False))
+        fake = [s for s in orig if s["kind"] not in ("L_SPRING", "L_TEST", "L_LPS", "L_BU")]
+        for i in picks:
+            fake.append(dict(idx=int(i), date=d.at[i, "date"], kind="L_RANDOM", side="long",
+                             stop=float(d.at[i, "close"] - stop_atr * d.at[i, "atr"]), note="", page="", tr_id=-1))
+        sc.signals = fake
+        t = backtest(sc, long_kinds=("L_RANDOM",))
+        if len(t):
+            exp.append(t["net_ret"].mean())
+    sc.signals = orig
+    return dict(rand_avg_net_mean=float(np.mean(exp)) if exp else math.nan,
+                rand_avg_net_p95=float(np.percentile(exp, 95)) if exp else math.nan)
+
+
+def relative_strength(stock: pd.DataFrame, index: pd.DataFrame, lookback: int = 60) -> pd.DataFrame:
+    """原書相對強弱〔p253-258〕：大盤創新低時個股沒有創新低、回調未過 50%；大盤回升時漲幅更大。"""
+    m = stock[["date", "close", "high", "low"]].merge(index[["date", "close", "low"]], on="date", suffixes=("", "_idx"))
+    m["rs"] = m["close"] / m["close_idx"]
+    m["idx_new_low"] = m["low_idx"] <= m["low_idx"].rolling(lookback).min()
+    m["stk_new_low"] = m["low"] <= m["low"].rolling(lookback).min()
+    hh = m["high"].rolling(lookback).max()
+    ll = m["low"].rolling(lookback).min()
+    m["stk_retr"] = (hh - m["close"]) / (hh - ll)
+    m["rs_divergence"] = m["idx_new_low"] & ~m["stk_new_low"] & (m["stk_retr"] < 0.5)
+    m["rs_score_60"] = m["rs_divergence"].rolling(lookback).sum()
+    return m
+
+
+def run_one(sym: str, df: pd.DataFrame, out: str, p: Params, index_df=None, trades_df=None, split=None):
+    sc = WyckoffScanner(df, p).run()
+    os.makedirs(out, exist_ok=True)
+    ev, sig, trs = sc.events_df(), sc.signals_df(), sc.trs_df()
+    ev.to_csv(f"{out}/events.csv", index=False, encoding="utf-8-sig")
+    sig.to_csv(f"{out}/signals.csv", index=False, encoding="utf-8-sig")
+    trs.to_csv(f"{out}/trs.csv", index=False, encoding="utf-8-sig")
+    sc.bars_df().to_csv(f"{out}/bars.csv", index=False, encoding="utf-8-sig")
+    t = backtest(sc)
+    t.to_csv(f"{out}/trades.csv", index=False, encoding="utf-8-sig")
+    event_study(sc).to_csv(f"{out}/event_study.csv", index=False, encoding="utf-8-sig")
+    with open(f"{out}/card.json", "w", encoding="utf-8") as f:
+        json.dump(snapshot(sc, symbol=sym), f, ensure_ascii=False, indent=2, default=str)
+    res = dict(symbol=sym, bars=len(df), start=str(df["date"].iloc[0])[:10], end=str(df["date"].iloc[-1])[:10],
+               n_tr=len(trs), n_events=len(ev), n_trades=len(t),
+               buy_hold=float(df["close"].iloc[-1] / df["close"].iloc[0] - 1))
+    if len(t):
+        res.update(win_rate=float((t["net_ret"] > 0).mean()), avg_net=float(t["net_ret"].mean()),
+                   avg_R=float(t["R"].mean()))
+        stop_atr = float(np.nanmedian(t["risk_atr"])) if t["risk_atr"].notna().any() else 1.5
+        stop_atr = 1.5 if (not np.isfinite(stop_atr) or stop_atr <= 0) else min(stop_atr, 5.0)
+        res.update(random_baseline(sc, len(t), stop_atr))
+        if split:
+            t["period"] = np.where(pd.to_datetime(t["entry_date"]) < pd.Timestamp(split), "in_sample", "out_sample")
+            for per, g in t.groupby("period"):
+                res[f"{per}_trades"], res[f"{per}_avg_net"] = len(g), float(g["net_ret"].mean())
+    if index_df is not None:
+        rs = relative_strength(df, index_df)
+        rs.to_csv(f"{out}/relative_strength.csv", index=False, encoding="utf-8-sig")
+        res["rs_score_60_last"] = float(rs["rs_score_60"].iloc[-1]) if len(rs) else math.nan
+    if trades_df is not None:
+        tt = trades_df if "symbol" not in trades_df else trades_df[trades_df["symbol"].astype(str) == str(sym)]
+        if len(tt):
+            audit_trades(sc, tt).to_csv(f"{out}/trade_review.csv", index=False, encoding="utf-8-sig")
+    return res, t
+
+
+def main():
+    ap = argparse.ArgumentParser(description="威科夫訊號引擎：台股 CSV 驗證")
+    ap.add_argument("csv", nargs="+")
+    ap.add_argument("--out", default="results")
+    ap.add_argument("--index", default=None, help="大盤 CSV（相對強弱）")
+    ap.add_argument("--trades", default=None, help="使用者買賣紀錄 CSV")
+    ap.add_argument("--split", default=None, help="樣本內/外分界日，如 2018-01-01")
+    a = ap.parse_args()
+    p = Params()
+    files = sorted({f for pat in a.csv for f in glob.glob(pat)})
+    index_df = None
+    if a.index:
+        index_df = list(load_ohlcv_csv(a.index).values())[0]
+    trades_df = pd.read_csv(a.trades) if a.trades else None
+    rows, all_t = [], []
+    for f in files:
+        try:
+            data = load_ohlcv_csv(f)
+        except Exception as e:
+            print(f"[略過] {f}: {e}")
+            continue
+        for sym, df in data.items():
+            if len(df) < 150:
+                print(f"[略過] {f}:{sym} 資料少於 150 根")
+                continue
+            name = sym if sym != "UNKNOWN" else os.path.splitext(os.path.basename(f))[0]
+            r, t = run_one(name, df, os.path.join(a.out, name), p, index_df, trades_df, a.split)
+            rows.append(r)
+            if len(t):
+                t.insert(0, "symbol", name)
+                all_t.append(t)
+            print(f"[完成] {name}: TR {r['n_tr']}、事件 {r['n_events']}、交易 {r['n_trades']}")
+    if not rows:
+        print("沒有可分析的資料。")
+        return
+    os.makedirs(a.out, exist_ok=True)
+    summ = pd.DataFrame(rows)
+    summ.to_csv(os.path.join(a.out, "summary_by_symbol.csv"), index=False, encoding="utf-8-sig")
+    lines = ["# 威科夫訊號驗證總表", "", f"- 檔案數：{len(files)}；股票數：{len(rows)}", ""]
+    if all_t:
+        T = pd.concat(all_t, ignore_index=True)
+        T.to_csv(os.path.join(a.out, "all_trades.csv"), index=False, encoding="utf-8-sig")
+        lines += ["## 各訊號交易統計（含交易成本）", "", to_md(summarize_trades(T)), ""]
+    lines += ["## 各股摘要（含隨機進場基準）", "", to_md(summ, index=False), "",
+              "> 判讀：策略平均淨報酬應明顯高於 rand_avg_net_mean，最好高於 rand_avg_net_p95，"
+              "且樣本外（out_sample）不顯著劣化，才算有效。"]
+    with open(os.path.join(a.out, "summary.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"總表：{os.path.join(a.out, 'summary.md')}")
+
+
+if __name__ == "__main__":
+    main()
