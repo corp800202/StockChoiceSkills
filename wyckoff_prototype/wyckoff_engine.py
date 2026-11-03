@@ -118,6 +118,8 @@ class Params:
     exit_on_stall: bool = True       # 【原書 p59–60】放量滯漲後次日量縮 → 清倉最後時機
     tighten_on_sot: bool = True      # 【原書 p141】SOT／通道式 SOT／波段放量滯漲／回調>50% → 縮緊停損
     exit_on_sot_retr: bool = True    # 【原書 p145–146】SOT 與回調>50% 先後出現 → 離場
+    # v1.3：台股驗證後新增（預設 0＝與 v1.2 相同；建議值見報告 10.15）
+    min_stop_atr: float = 0.0        # 【延伸】進場價到停損至少 N 倍 ATR（訊號 K 的 ATR）；結構停損太近時往下放寬
 
 
 # ---------------------------------------------------------------------------
@@ -1507,9 +1509,24 @@ LONG_KINDS = ("L_SPRING", "L_TEST", "L_LPS", "L_BU", "L_PULLBACK", "L_CORNER")
 EXIT_KINDS = ("X_ICE", "S_UT", "S_LPSY", "S_NODEMAND")
 TIGHTEN_KINDS = ("W_SOT_up", "W_SOT_CH", "W_WAVE_STALL_UP")
 
+# v1.3：台股第一輪實證後的建議設定（報告 10.15.3、規格第 14 章；樣本內決定、樣本外確認）
+TW_LONG_KINDS = ("L_SPRING", "L_TEST", "L_LPS", "L_BU")      # 區間結構訊號；L_PULLBACK、L_CORNER 降為觀察名單
+
+
+def tw_params(base: Optional[Params] = None) -> Params:
+    """台股建議參數：進場價到停損至少 1.5 ATR，其餘沿用原書規則。"""
+    return replace(base or Params(), min_stop_atr=1.5)
+
+
+def liquidity_mask(d: pd.DataFrame, unit: float = 1.0, threshold: float = 5e7, n: int = 60) -> np.ndarray:
+    """近 n 日平均成交值（收盤價 × 成交量 × unit）≥ threshold 的布林陣列，只用當日以前的資料。
+    unit：成交量單位為「股」填 1、「張」填 1000。"""
+    tv = d["close"] * d["volume"] * unit
+    return (tv.rolling(n, min_periods=20).mean() >= threshold).fillna(False).to_numpy(bool)
+
 
 def backtest(sc: WyckoffScanner, long_kinds=LONG_KINDS, exit_kinds=EXIT_KINDS, p: Optional[Params] = None,
-             weekly_filter: Optional[bool] = None) -> pd.DataFrame:
+             weekly_filter: Optional[bool] = None, entry_mask=None) -> pd.DataFrame:
     """一次只持有一筆多單。規則：
     - 訊號 K 線收盤確認，下一根開盤進場；開盤已跌破停損則放棄。
     - 停損：訊號提供的結構停損（Spring/測試低點、LPS 低點、JOC K 線低點）。
@@ -1522,6 +1539,8 @@ def backtest(sc: WyckoffScanner, long_kinds=LONG_KINDS, exit_kinds=EXIT_KINDS, p
       SOT 類警示與回調超過 50% 在 10 根內先後出現：下一根開盤出場〔p145–146〕。
     - 確認後出現放量滯漲（量增、振幅縮小）且次日量縮到 0.8 倍均量以下：當日收盤出場〔p59–60〕。
     - weekly_filter=True 時，週線仍在下跌且尚未形成區間的日子不接受多方訊號〔p147、p225〕。
+    - entry_mask（與 K 線等長的布林陣列，例如流動性門檻）為 False 的訊號日不接受多方訊號。
+    - p.min_stop_atr > 0 時，進場價到停損至少 min_stop_atr 倍 ATR（以訊號 K 的 ATR 計，無未來函數）【延伸】。
     - 交易成本：買 0.1425%、賣 0.4425%（含證交稅）。
     """
     p = p or sc.p
@@ -1542,7 +1561,12 @@ def backtest(sc: WyckoffScanner, long_kinds=LONG_KINDS, exit_kinds=EXIT_KINDS, p
         o, h, l, c = d.at[i, "open"], d.at[i, "high"], d.at[i, "low"], d.at[i, "close"]
         if pos is None and pending is not None:
             if o > pending["stop"]:
-                pos = dict(entry_i=i, entry=o, stop=pending["stop"], init_stop=pending["stop"], kind=pending["kind"],
+                stop0 = pending["stop"]
+                if p.min_stop_atr > 0:
+                    a_sig = d.at[pending["idx"], "atr"]
+                    if a_sig == a_sig and a_sig > 0:
+                        stop0 = min(stop0, o - p.min_stop_atr * a_sig)
+                pos = dict(entry_i=i, entry=o, stop=stop0, init_stop=stop0, kind=pending["kind"],
                            sig_high=d.at[pending["idx"], "high"], confirmed=False, exit_next=False)
             pending = None
         if pos is not None:
@@ -1597,7 +1621,7 @@ def backtest(sc: WyckoffScanner, long_kinds=LONG_KINDS, exit_kinds=EXIT_KINDS, p
                                    ret=gross, net_ret=net, R=(px - pos["entry"]) / risk if risk > 0 else NaN,
                                    reason=reason))
                 pos = None
-        if pos is None and pending is None and (wk_ok is None or wk_ok[i]):
+        if pos is None and pending is None and (wk_ok is None or wk_ok[i]) and (entry_mask is None or entry_mask[i]):
             for r in by_idx.get(i, []):
                 if r.kind in long_kinds and not math.isnan(r.stop):
                     pending = dict(idx=i, stop=r.stop, kind=r.kind)

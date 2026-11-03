@@ -18,7 +18,8 @@ NaN = float("nan")
 from wyckoff_engine import (Params, WyckoffScanner, add_features, bar_signals, backtest,
                             snapshot, audit_trades, load_ohlcv_csv, summarize_trades, event_study,
                             zigzag, channels, to_weekly, weekly_context, pnf_columns, cause_target,
-                            LONG_KINDS, wave_events, waves, relative_strength, position_size)
+                            LONG_KINDS, wave_events, waves, relative_strength, position_size,
+                            tw_params, liquidity_mask, TW_LONG_KINDS)
 
 
 class Builder:
@@ -441,6 +442,23 @@ class TestPullbackAndCorner(unittest.TestCase):
         t = backtest(sc)
         self.assertTrue((t["kind"] == "L_PULLBACK").any())
 
+    def test_min_stop_distance_and_entry_mask(self):
+        """v1.3：最小停損距離只會把停損往下放寬；進場遮罩為 False 時不進場。"""
+        df, m = make_bull_pullback()
+        sc = WyckoffScanner(df).run()
+        t0 = backtest(sc)
+        t2 = backtest(sc, p=Params(min_stop_atr=2.0))
+        self.assertFalse(t2.empty)
+        for r in t2.itertuples():
+            i = int(sc.d.index[sc.d["date"] == r.entry_date][0])
+            self.assertLessEqual(r.init_stop, r.entry - 2.0 * sc.d.at[i - 1, "atr"] + 1e-9,
+                                 "停損距離應至少 2 倍訊號K的 ATR")
+        self.assertGreaterEqual(len(t0), 1)
+        self.assertLessEqual(float(t2["init_stop"].iloc[0]), float(t0["init_stop"].iloc[0]),
+                             "最小停損距離只能放寬、不能收緊結構停損")
+        none = backtest(sc, entry_mask=np.zeros(len(sc.d), dtype=bool))
+        self.assertTrue(none.empty, "進場遮罩全為 False 時不應有交易")
+
     def test_pullback_rejected_when_too_deep_or_supply(self):
         for kwargs in (dict(pb_end=111.0, trigger_close=110.0), dict(supply_bar=True)):
             df, m = make_bull_pullback(**kwargs)
@@ -538,6 +556,21 @@ class TestSelectionAndSizing(unittest.TestCase):
         self.assertLessEqual(r["risk_amount"], 10_000)
         self.assertEqual(position_size(1_000_000, 100, 95, risk_pct=0.01, allow_odd_lot=False)["shares"], 1000)
         self.assertEqual(position_size(1_000_000, 100, 101)["shares"], 0)
+
+    def test_tw_preset_and_liquidity_mask(self):
+        """v1.3 台股建議設定：最小停損 1.5 ATR、區間結構訊號；流動性遮罩只用當日以前的資料。"""
+        p = tw_params()
+        self.assertEqual(p.min_stop_atr, 1.5)
+        self.assertEqual(p.confirm_bars, Params().confirm_bars, "其餘參數應沿用原書規則")
+        self.assertNotIn("L_PULLBACK", TW_LONG_KINDS)
+        n = 80
+        vol = np.where(np.arange(n) < 40, 100.0, 1000.0)            # 前 40 日每日 1,000 萬元，之後每日 1 億元
+        d = pd.DataFrame(dict(close=np.full(n, 100.0), volume=vol))
+        m = liquidity_mask(d, unit=1000, threshold=5e7)
+        self.assertFalse(m[:40].any(), "成交值不足時不應通過")
+        self.assertTrue(m[-1])
+        m2 = liquidity_mask(d.iloc[:50], unit=1000, threshold=5e7)
+        self.assertTrue((m2 == m[:50]).all(), "截斷資料後結果應相同（無未來函數）")
 
 
 class TestCsvLoader(unittest.TestCase):
