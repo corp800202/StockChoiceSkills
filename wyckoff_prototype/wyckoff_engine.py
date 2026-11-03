@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from typing import Optional
 
 import numpy as np
@@ -94,6 +94,13 @@ class Params:
     max_hold: int = 120
     buy_cost: float = 0.001425       # 台股手續費（未折扣）
     sell_cost: float = 0.004425      # 手續費 0.1425% + 證交稅 0.3%
+    # 通道線〔p38、p65 註8、p132、p142–147、p263–270〕
+    channel_min_sep: int = 5         # 兩個波段低點至少相隔 5 根才畫通道【延伸】
+    channel_min_width_atr: float = 1.0
+    exit_on_demand_line_break: bool = True   # 【原書 p142、p146】帶量跌破上升趨勢線（需求線）→ 持股離場
+    # 多時間框架：由日 K 合成週 K 作為大背景〔p31、p127、p146、p268–272〕
+    use_weekly: bool = True
+    weekly_filter: bool = False      # True：週線仍在下跌且尚未形成區間時，不採用日線多方訊號〔p147、p225〕
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +386,232 @@ def pivot_warnings(d: pd.DataFrame, piv: list) -> list:
 
 
 # ---------------------------------------------------------------------------
+# 通道線（超買線／超賣線／供應線／需求線）
+# ---------------------------------------------------------------------------
+def channels(d: pd.DataFrame, piv: list, p: Params = Params()) -> dict:
+    """以「已確認」的波段低點畫通道（無未來函數）。
+
+    上升通道：需求線（支撐線、上升趨勢線）＝連接兩個墊高的波段低點；
+              超買線＝通過兩低點之間最高點的平行線（通道上軌）〔p38、p142、p269–270〕。
+    下降通道：超賣線＝連接兩個連續、下降的波段低點〔p263〕；
+              供應線＝通過兩低點之間最高點的平行線（通道上軌）〔p65 註8、p132〕。
+    中線＝上下軌平均〔p132、p143〕。
+
+    事件（每個都有 idx 與 confirm）：
+      OVERSOLD            價格回到或跌破超賣線〔p65 註2、p263–264〕
+      SUPPLY_LINE_BREAK   收盤突破供應線；放量（rvol>=1.3、rspread>=1.0）才算強〔p65 註8、p112、p132〕
+      OVERBOUGHT          觸及超買線，觀察供應〔p38、p98、p235〕
+      DEMAND_LINE_BREAK   收盤跌破需求線；放量（rvol>=1.2）才算強＝持股離場〔p142、p146、p270〕
+      SOT_CH_UP           回調到需求線後，反彈到不了超買線（只到中線以下更弱）〔p142–143、p186〕
+      SOT_CH_DOWN         下跌到不了超賣線（供應減弱）〔p132、p142〕
+    """
+    n = len(d)
+    h, l, c = (d[k].to_numpy(float) for k in ("high", "low", "close"))
+    atr = d["atr"].bfill().ffill().to_numpy(float)
+    rvol = d["rvol"].fillna(1.0).to_numpy(float)
+    rsp = d["rspread"].fillna(1.0).to_numpy(float)
+    ch_dir = np.array([""] * n, dtype=object)
+    lower, upper = np.full(n, NaN), np.full(n, NaN)
+    events, fired = [], {}
+    pv = sorted(piv, key=lambda x: (x["confirm"], x["idx"]))
+    lows = []
+    cur, cid, k = None, 0, 0
+
+    def line(ch, t):
+        return ch["y1"] + ch["slope"] * (t - ch["t1"])
+
+    def build():
+        if len(lows) < 2:
+            return None
+        a, b = lows[-2], lows[-1]
+        if b["idx"] - a["idx"] < p.channel_min_sep:
+            return None
+        slope = (b["price"] - a["price"]) / (b["idx"] - a["idx"])
+        off = max(h[t] - (a["price"] + slope * (t - a["idx"])) for t in range(a["idx"], b["idx"] + 1))
+        ab = atr[b["idx"]]
+        if not np.isfinite(ab) or off < p.channel_min_width_atr * ab:
+            return None
+        if b["price"] > a["price"] + 0.25 * ab:
+            dirn = "up"
+        elif b["price"] < a["price"] - 0.25 * ab:
+            dirn = "down"
+        else:
+            return None
+        return dict(dir=dirn, t1=a["idx"], y1=a["price"], slope=slope, off=off, start=b["confirm"])
+
+    def emit(t, idx, kind, price, note, page, strong=False):
+        events.append(dict(idx=int(idx), confirm=int(t), kind=kind, price=float(price),
+                           note=note, page=page, strong=bool(strong), cid=cid))
+
+    def once(t, kind, gap=None):
+        last = fired.get((cid, kind))
+        if last is not None and (gap is None or t - last <= gap):
+            return False
+        fired[(cid, kind)] = t
+        return True
+
+    for t in range(n):
+        while k < len(pv) and pv[k]["confirm"] <= t:
+            q = pv[k]
+            k += 1
+            if cur is not None and q["idx"] >= cur["t1"]:          # 用「舊通道」檢查通道式 SOT
+                lo_q = line(cur, q["idx"])
+                up_q, mid_q = lo_q + cur["off"], lo_q + cur["off"] / 2
+                if cur["dir"] == "up" and q["kind"] == "H" and lows:
+                    pl = lows[-1]
+                    deep = pl["price"] <= line(cur, pl["idx"]) + 0.25 * cur["off"]
+                    if deep and q["price"] < up_q - 0.25 * cur["off"]:
+                        lvl = "只到中線以下" if q["price"] < mid_q else "未達超買線"
+                        emit(t, q["idx"], "SOT_CH_UP", q["price"],
+                             f"回調到需求線後的反彈{lvl}：突破幅度縮小（需求減弱，縮緊停損）", "p142-143,p186")
+                if cur["dir"] == "down" and q["kind"] == "L" and q["price"] > lo_q + 0.25 * cur["off"]:
+                    emit(t, q["idx"], "SOT_CH_DOWN", q["price"], "下跌未能到達超賣線：供應減弱，待吸籌過程驗證", "p132,p142")
+            if q["kind"] == "L":
+                lows.append(q)
+                nb = build()
+                if nb is not None:
+                    cid += 1
+                    cur = nb
+        if cur is None:
+            continue
+        lo = line(cur, t)
+        up = lo + cur["off"]
+        ch_dir[t], lower[t], upper[t] = cur["dir"], lo, up
+        if t < cur["start"]:
+            continue
+        if cur["dir"] == "down":
+            if l[t] <= lo and once(t, "OVERSOLD", 5):
+                emit(t, t, "OVERSOLD", l[t], "價格回到或跌破超賣線：超賣，之後至少會有反彈", "p65,p263-264")
+            if c[t] > up + 0.1 * atr[t] and once(t, "SUPPLY_LINE_BREAK"):
+                strong = rvol[t] >= 1.3 and rsp[t] >= 1.0
+                emit(t, t, "SUPPLY_LINE_BREAK", c[t],
+                     "放量突破供應線：需求吸收了供應線上的賣單，可能反轉（仍須看供應是否枯竭）" if strong
+                     else "突破供應線但量能不足，需觀察後續", "p65,p112,p132", strong)
+        else:
+            if h[t] >= up and once(t, "OVERBOUGHT", 5):
+                emit(t, t, "OVERBOUGHT", h[t], "觸及超買線：觀察是否出現供應（放量上影或放量回落）", "p38,p98,p235")
+            if c[t] < lo - 0.1 * atr[t] and once(t, "DEMAND_LINE_BREAK"):
+                strong = rvol[t] >= p.vol_up
+                emit(t, t, "DEMAND_LINE_BREAK", c[t],
+                     "放量跌破需求線（上升趨勢線）：供應超過需求，持股離場" if strong
+                     else "跌破需求線但未放量，要看跌破過程與後續跟隨", "p142,p146,p270", strong)
+        # 收盤明確穿出通道 1 ATR：通道失效，等新的波段低點重畫【延伸】
+        if (cur["dir"] == "up" and c[t] < lo - atr[t]) or (cur["dir"] == "down" and c[t] > up + atr[t]):
+            cur = None
+    return dict(dir=ch_dir, lower=lower, upper=upper, mid=(lower + upper) / 2, events=events)
+
+
+# ---------------------------------------------------------------------------
+# 多時間框架：週線背景
+# ---------------------------------------------------------------------------
+def to_weekly(df: pd.DataFrame) -> pd.DataFrame:
+    """日 K → 週 K（週五為週別）。date 取該週最後一個交易日＝這根週 K 資料完整的時點。"""
+    d = df[["date", "open", "high", "low", "close", "volume"]].copy()
+    d["date"] = pd.to_datetime(d["date"])
+    d = d.sort_values("date")
+    g = d.groupby(d["date"].dt.to_period("W-FRI"), sort=True)
+    w = pd.DataFrame({"date": g["date"].max(), "open": g["open"].first(), "high": g["high"].max(),
+                      "low": g["low"].min(), "close": g["close"].last(), "volume": g["volume"].sum()})
+    return w.reset_index(drop=True)
+
+
+def weekly_params(base: Params = Params()) -> Params:
+    """週線用參數【參數】：均線約 30 週、高潮判斷窗半年、AR/ST 等待窗依週數縮短；
+    週量為 5 日合計、較日量平滑，高潮與放量門檻略降。"""
+    return replace(base, n=20, trend_n=30, slope_n=4, climax_lookback=26, trend_lookback=52,
+                   vol_climax=1.6, vol_high=1.3, spread_big=1.2,
+                   min_decline=0.20, min_rise=0.25, ar_max_bars=12, st_max_bars=40, test_window=10,
+                   lps_max_bars=8, lpsy_max_bars=8, max_tr_bars=150, confirm_bars=3, max_hold=52,
+                   use_weekly=False, weekly_filter=False)
+
+
+def weekly_context(df: pd.DataFrame, p: Params = Params()):
+    """在週線上跑同一套狀態機，並以「已完成的週」對應回每根日 K（merge_asof 向後對齊，無未來函數）。
+
+    wk_ok_long＝False 代表：週線仍是下降背景，且尚未出現由高潮/二次測試構成的區間（Phase 空白、A 或 E）。
+    依原書「熊市中不能隨意抄底」〔p225〕、「進場前先看市場背景」〔p147〕，此時日線多方訊號應降級或略過。
+    """
+    w = to_weekly(df)
+    n = len(df)
+    empty = pd.DataFrame({"wk_regime": [""] * n, "wk_phase": [""] * n, "wk_bias": [0.0] * n, "wk_ok_long": [True] * n})
+    if len(w) < 40:
+        return empty, None
+    wsc = WyckoffScanner(w, weekly_params(p)).run()
+    wb = wsc.bars_df()[["date", "regime", "phase", "bias"]].rename(
+        columns={"regime": "wk_regime", "phase": "wk_phase", "bias": "wk_bias"})
+    wb["date"] = pd.to_datetime(wb["date"])
+    left = pd.DataFrame({"date": pd.to_datetime(df["date"]).to_numpy(), "_i": np.arange(n)})
+    m = pd.merge_asof(left.sort_values("date"), wb.sort_values("date"), on="date", direction="backward")
+    m = m.sort_values("_i").reset_index(drop=True)
+    m["wk_regime"] = m["wk_regime"].fillna("")
+    m["wk_phase"] = m["wk_phase"].fillna("")
+    m["wk_bias"] = m["wk_bias"].fillna(0.0)
+    m["wk_ok_long"] = ~((m["wk_regime"] == "down") & (m["wk_phase"].isin(["", "A", "E"])))
+    return m[["wk_regime", "wk_phase", "wk_bias", "wk_ok_long"]], wsc
+
+
+# ---------------------------------------------------------------------------
+# 點數圖（Point & Figure）與因果目標【延伸：原書僅在 p11 提到點數圖，未教授數格】
+# ---------------------------------------------------------------------------
+def pnf_columns(prices, box: float, reversal: int = 3) -> list:
+    """收盤價點數圖。回傳欄位清單：dir（X 上漲欄／O 下跌欄）、top、bot、start、end。"""
+    prices = np.asarray(prices, float)
+    cols, cur = [], None
+    if len(prices) == 0 or not np.isfinite(box) or box <= 0:
+        return cols
+    p0 = prices[0]
+    for i, x in enumerate(prices):
+        if cur is None:
+            if x >= p0 + box:
+                cur = dict(dir="X", top=p0 + box * np.floor((x - p0) / box), bot=p0, start=0, end=i)
+            elif x <= p0 - box:
+                cur = dict(dir="O", top=p0, bot=p0 - box * np.floor((p0 - x) / box), start=0, end=i)
+            continue
+        if cur["dir"] == "X":
+            if x >= cur["top"] + box:
+                cur["top"] += box * np.floor((x - cur["top"]) / box)
+                cur["end"] = i
+            elif x <= cur["top"] - reversal * box:
+                cols.append(cur)
+                cur = dict(dir="O", top=cur["top"] - box, bot=cur["top"] - box * np.floor((cur["top"] - x) / box), start=i, end=i)
+        else:
+            if x <= cur["bot"] - box:
+                cur["bot"] -= box * np.floor((cur["bot"] - x) / box)
+                cur["end"] = i
+            elif x >= cur["bot"] + reversal * box:
+                cols.append(cur)
+                cur = dict(dir="X", top=cur["bot"] + box * np.floor((x - cur["bot"]) / box), bot=cur["bot"] + box, start=i, end=i)
+    if cur is not None:
+        cols.append(cur)
+    return cols
+
+
+def cause_target(sc, tr=None, reversal: int = 3) -> Optional[dict]:
+    """【延伸】點數圖橫向數格：交易區間內的欄數 × 格值 × 反轉格數 ≈「因」可推動的「果」。
+
+    格值取區間內 ATR 中位數的一半；多方目標自區間下緣（保守）或中線起算，空方目標自區間上緣或中線起算。
+    原書沒有教授這個方法，結果僅供參考，必須以台股資料回測後才可使用。
+    """
+    tr = tr or sc.tr or (sc.trs[-1] if sc.trs else None)
+    if tr is None or not np.isfinite(tr.support) or not np.isfinite(tr.resistance):
+        return None
+    d = sc.d
+    s0 = tr.climax_idx
+    e0 = tr.end if tr.end >= 0 else len(d) - 1
+    seg = d["close"].to_numpy(float)[s0:e0 + 1]
+    if len(seg) < 10:
+        return None
+    box = float(np.nanmedian(d["atr"].to_numpy(float)[s0:e0 + 1])) / 2
+    cols = pnf_columns(seg, box, reversal)
+    move = len(cols) * box * reversal
+    mid = (tr.support + tr.resistance) / 2
+    return dict(tr_id=tr.id, columns=len(cols), box=round(box, 4), reversal=reversal,
+                bull_from_support=round(tr.support + move, 2), bull_from_mid=round(mid + move, 2),
+                bear_from_resistance=round(tr.resistance - move, 2), bear_from_mid=round(mid - move, 2),
+                note="【延伸】點數圖橫向數格估算（欄數×格值×反轉格數）；原書未教授，僅供參考，需回測驗證")
+
+
+# ---------------------------------------------------------------------------
 # 交易區間（TR）掃描器：事件、Phase、訊號
 # ---------------------------------------------------------------------------
 @dataclass
@@ -419,6 +652,8 @@ EVENT_PAGES = {
     "LPS": "p115,p133", "BU": "p106,p111", "SOS失效": "p93,p98", "UT": "p66,p154",
     "UTAD": "p182-184", "UT確認": "p154", "SOW": "p66,p155-156", "ICE": "p65,p156,p160",
     "LPSY": "p152,p156", "SOW失效": "p161", "MarkupE": "p92,p98", "MarkdownE": "p148,p156",
+    "OVERSOLD": "p65,p263-264", "SUPPLY_LINE_BREAK": "p65,p112,p132", "OVERBOUGHT": "p38,p98,p235",
+    "DEMAND_LINE_BREAK": "p142,p146,p270", "SOT_CH_UP": "p142-143,p186", "SOT_CH_DOWN": "p132,p142",
 }
 
 
@@ -448,6 +683,15 @@ class WyckoffScanner:
         self.bar_sup = [NaN] * n
         self.bar_res = [NaN] * n
         self._last_resolved: Optional[TR] = None
+        # 通道線（只用已確認的轉折點）
+        self.ch = channels(self.d, self.piv, p)
+        self._ch_by_conf = {}
+        for e in self.ch["events"]:
+            self._ch_by_conf.setdefault(e["confirm"], []).append(e)
+        # 週線背景（以已完成的週對應回日 K）
+        self.wk, self.wsc = None, None
+        if p.use_weekly and "date" in self.d:
+            self.wk, self.wsc = weekly_context(self.d, p)
 
     # ---------------- helpers ----------------
     def _ev(self, idx, confirm, kind, price, note="", tr=None, w=0.0):
@@ -464,6 +708,8 @@ class WyckoffScanner:
 
     def _sig(self, i, kind, side, stop=NaN, note="", page="", tr=None):
         tr = tr if tr is not None else self.tr
+        if side == "long" and self.wk is not None and not bool(self.wk.at[int(i), "wk_ok_long"]):
+            note += "；⚠ 週線仍在下跌且尚未形成區間，逆大背景〔p147、p225〕"
         self.signals.append(dict(idx=int(i), date=self.d.at[int(i), "date"] if "date" in self.d else i,
                                  kind=kind, side=side, stop=float(stop), note=note, page=page,
                                  tr_id=(tr.id if tr else -1)))
@@ -908,11 +1154,32 @@ class WyckoffScanner:
                 keep.append(st)
         self.setups = [st for st in keep if group(st) not in fired]
 
+    # ---------------- 通道事件併入 ----------------
+    def _channel_events(self, i):
+        """把當根確認的通道事件併入事件表，並依原書意義調整進行中區間的偏多/偏空分數。"""
+        for e in self._ch_by_conf.get(i, []):
+            tr, k, strong = self.tr, e["kind"], e["strong"]
+            w = 0.0
+            if k == "SUPPLY_LINE_BREAK" and strong:
+                w = 1.0 if (tr is not None and tr.prior == "down") else 0.5   # 驗證 SC 形成的臨時支撐〔p112〕
+            elif k == "DEMAND_LINE_BREAK":
+                w = -1.0 if strong else -0.3
+            elif k == "SOT_CH_UP":
+                w = -0.5
+            elif k == "SOT_CH_DOWN":
+                w = 0.5
+            self._ev(e["idx"], e["confirm"], k, e["price"], e["note"], tr, w)
+            if k == "DEMAND_LINE_BREAK" and strong and self.p.exit_on_demand_line_break:
+                self._sig(i, "X_TRENDLINE", "exit", NaN, "放量跌破需求線（上升趨勢線）：無論盈虧離場", "p142,p146", tr)
+            elif k == "SOT_CH_UP":
+                self._sig(i, "W_SOT_CH", "warn", NaN, e["note"], e["page"], tr)
+
     # ---------------- 主迴圈 ----------------
     def run(self):
         n = len(self.d)
         for i in range(1, n):
             self._process_setups(i)
+            self._channel_events(i)
             tr = self.tr
             if tr is None:
                 k = self._climax_at(i)
@@ -986,6 +1253,11 @@ class WyckoffScanner:
         ind = wyckoff_indicators(self.d, self.s)
         for k in ("ud_vol_ratio", "evr", "dry_up", "range_pos", "contraction", "dead_corner", "demand_score"):
             out[k] = ind[k]
+        out["ch_dir"], out["ch_lower"], out["ch_upper"], out["ch_mid"] = \
+            self.ch["dir"], self.ch["lower"], self.ch["upper"], self.ch["mid"]
+        if self.wk is not None:
+            for k in ("wk_regime", "wk_phase", "wk_bias", "wk_ok_long"):
+                out[k] = self.wk[k].to_numpy()
         return out
 
 
@@ -996,7 +1268,8 @@ LONG_KINDS = ("L_SPRING", "L_TEST", "L_LPS", "L_BU")
 EXIT_KINDS = ("X_ICE", "S_UT", "S_LPSY")
 
 
-def backtest(sc: WyckoffScanner, long_kinds=LONG_KINDS, exit_kinds=EXIT_KINDS, p: Optional[Params] = None) -> pd.DataFrame:
+def backtest(sc: WyckoffScanner, long_kinds=LONG_KINDS, exit_kinds=EXIT_KINDS, p: Optional[Params] = None,
+             weekly_filter: Optional[bool] = None) -> pd.DataFrame:
     """一次只持有一筆多單。規則：
     - 訊號 K 線收盤確認，下一根開盤進場；開盤已跌破停損則放棄。
     - 停損：訊號提供的結構停損（Spring/測試低點、LPS 低點、JOC K 線低點）。
@@ -1004,10 +1277,15 @@ def backtest(sc: WyckoffScanner, long_kinds=LONG_KINDS, exit_kinds=EXIT_KINDS, p
     - 確認期內出現放量陰線立即出場〔p83、p304〕。
     - 確認後停損上移至最近已確認的波段低點（收緊停損〔p17、p141〕）。
     - 出現破冰／UT 確認／LPSY 訊號，下一根開盤出場；搶購高潮則停損上移到 BC 低點。
+    - 確認後若放量跌破需求線（X_TRENDLINE），下一根開盤出場〔p142、p146〕。
+    - weekly_filter=True 時，週線仍在下跌且尚未形成區間的日子不接受多方訊號〔p147、p225〕。
     - 交易成本：買 0.1425%、賣 0.4425%（含證交稅）。
     """
     p = p or sc.p
     d, s = sc.d, sc.s
+    wf = p.weekly_filter if weekly_filter is None else weekly_filter
+    wk_ok = sc.wk["wk_ok_long"].to_numpy(bool) if (wf and sc.wk is not None) else None
+    trend_exit = p.exit_on_demand_line_break
     sig = sc.signals_df()
     if sig.empty:
         return pd.DataFrame()
@@ -1047,7 +1325,7 @@ def backtest(sc: WyckoffScanner, long_kinds=LONG_KINDS, exit_kinds=EXIT_KINDS, p
                     reason, px = "持有期滿", c
             if reason is None:
                 for r in by_idx.get(i, []):
-                    if r.kind in exit_kinds:
+                    if r.kind in exit_kinds or (trend_exit and r.kind == "X_TRENDLINE" and pos["confirmed"]):
                         pos["exit_next"], pos["exit_reason"] = True, f"出場訊號 {r.kind}"
                     elif r.kind == "W_BC":
                         pos["stop"] = max(pos["stop"], d.at[i, "low"])
@@ -1062,7 +1340,7 @@ def backtest(sc: WyckoffScanner, long_kinds=LONG_KINDS, exit_kinds=EXIT_KINDS, p
                                    ret=gross, net_ret=net, R=(px - pos["entry"]) / risk if risk > 0 else NaN,
                                    reason=reason))
                 pos = None
-        if pos is None and pending is None:
+        if pos is None and pending is None and (wk_ok is None or wk_ok[i]):
             for r in by_idx.get(i, []):
                 if r.kind in long_kinds and not math.isnan(r.stop):
                     pending = dict(idx=i, stop=r.stop, kind=r.kind)
@@ -1137,11 +1415,28 @@ def snapshot(sc: WyckoffScanner, lookback: int = 20, symbol: Optional[str] = Non
         indicators=dict(ud_vol_ratio=num(ind["ud_vol_ratio"]), demand_score=num(ind["demand_score"]),
                         dry_up=num(ind["dry_up"]), range_pos=num(ind["range_pos"]),
                         dead_corner=bool(ind["dead_corner"])),
+        channel=None,
+        weekly=None,
+        cause_target=cause_target(sc),
         rule_reminders=[
             "震盪區內部交易風險最大，耐心等右手邊出現 SOS 或 SOW〔p93、p153、p191〕",
             "進場後 1~5 根內沒有價量齊揚的跟隨，就無條件出場〔p316〕",
         ],
     )
+    cd = sc.ch["dir"][i]
+    if cd:
+        lo, up = float(sc.ch["lower"][i]), float(sc.ch["upper"][i])
+        pos = (float(d.at[i, "close"]) - lo) / (up - lo) if up > lo else NaN
+        card["channel"] = dict(direction="上升通道" if cd == "up" else "下降通道",
+                               lower=round(lo, 2), upper=round(up, 2), mid=round((lo + up) / 2, 2), position=num(pos),
+                               lower_name="需求線" if cd == "up" else "超賣線",
+                               upper_name="超買線" if cd == "up" else "供應線")
+    if sc.wk is not None:
+        w = sc.wk.iloc[i]
+        card["weekly"] = dict(regime=dict(up="上升", down="下降", range="區間/不明").get(w["wk_regime"], "資料不足"),
+                              phase=w["wk_phase"] or "無有效區間", bias=num(w["wk_bias"]), ok_long=bool(w["wk_ok_long"]))
+        if not bool(w["wk_ok_long"]):
+            card["rule_reminders"].append("週線仍在下跌且尚未形成區間：熊市中不能隨意抄底〔p225〕")
     return card
 
 
@@ -1176,6 +1471,10 @@ def audit_trades(sc: WyckoffScanner, trades: pd.DataFrame) -> pd.DataFrame:
                 flags.append("✘ 供應控制背景下買進（原書：抢反弹是逆勢〔p147〕）")
             if d.at[i, "regime"] == "down" and ph not in ("B", "C", "D", "E"):
                 flags.append("△ 下降背景且尚未出現 SC/ST 構成的區間（原書：熊市不隨意抄底〔p225〕）")
+            if sc.wk is not None and not bool(sc.wk.at[i, "wk_ok_long"]):
+                flags.append("△ 週線仍在下跌且尚未形成區間（逆大背景〔p147〕）")
+            if "DEMAND_LINE_BREAK" in kinds:
+                flags.append("✘ 剛放量跌破需求線後買進（原書：供應超過需求〔p142、p146〕）")
         else:
             if kinds & {"SC", "Spring", "Shakeout", "Test"}:
                 flags.append("✘ 賣在恐慌拋售/震倉附近（原書：公眾在底部割肉〔p72、p131〕）")

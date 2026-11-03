@@ -24,6 +24,8 @@
   - 交易成本：買 0.1425%、賣 0.4425%（含 0.3% 證交稅）。
   - 基準：同一檔股票、相同停損距離（以 ATR 計）與相同出場規則的隨機進場，重複 200 次。
   - 參數應以前段樣本校準、後段樣本驗證（--split 2018-01-01 會分段輸出）。
+  - 週線過濾：同時回報「不過濾／過濾逆週線背景的多方訊號」兩組結果〔p147、p225〕。
+  - 參數穩健性（--sensitivity）：主要【參數】門檻 ±20% 單變數調整；原書規則（如 Spring 1~3 根）不調。
 """
 from __future__ import annotations
 
@@ -32,12 +34,49 @@ import glob
 import json
 import math
 import os
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
 
 from wyckoff_engine import (Params, WyckoffScanner, backtest, summarize_trades, event_study,
                             snapshot, audit_trades, load_ohlcv_csv)
+
+# 單變數敏感度（只調整【參數】類門檻）
+SENS_GRID = {
+    "vol_climax": [1.6, 2.4],
+    "vol_high": [1.2, 1.8],
+    "st_vol_ratio": [0.64, 0.96],
+    "ar_min_atr": [1.6, 2.4],
+    "shakeout_depth_atr": [0.8, 1.2],
+    "min_decline": [0.12, 0.18],
+    "min_rise": [0.16, 0.24],
+    "confirm_bars": [3, 7],
+}
+
+
+def trade_sums(t: pd.DataFrame) -> dict:
+    """可跨股票加總的交易統計（筆數、淨報酬和、勝場、R 和）。"""
+    if t is None or len(t) == 0:
+        return dict(trades=0, sum_net=0.0, wins=0, sum_R=0.0, n_R=0)
+    return dict(trades=len(t), sum_net=float(t["net_ret"].sum()), wins=int((t["net_ret"] > 0).sum()),
+                sum_R=float(t["R"].sum(skipna=True)), n_R=int(t["R"].notna().sum()))
+
+
+def sums_to_stats(s: dict) -> dict:
+    n = s["trades"]
+    return dict(trades=n, win_rate=s["wins"] / n if n else math.nan, avg_net=s["sum_net"] / n if n else math.nan,
+                avg_R=s["sum_R"] / s["n_R"] if s["n_R"] else math.nan)
+
+
+def sensitivity(df: pd.DataFrame, p: Params, grid: dict = SENS_GRID) -> pd.DataFrame:
+    """主要參數 ±20% 的單變數敏感度。結果平滑＝穩健；只有單一組合有效＝過度擬合的警訊。"""
+    rows = [dict(param="(基準)", value="", **trade_sums(backtest(WyckoffScanner(df, p).run())))]
+    for name, vals in grid.items():
+        for v in vals:
+            t = backtest(WyckoffScanner(df, replace(p, **{name: v})).run())
+            rows.append(dict(param=name, value=v, **trade_sums(t)))
+    return pd.DataFrame(rows)
 
 
 def to_md(df: pd.DataFrame, index: bool = True) -> str:
@@ -88,7 +127,8 @@ def relative_strength(stock: pd.DataFrame, index: pd.DataFrame, lookback: int = 
     return m
 
 
-def run_one(sym: str, df: pd.DataFrame, out: str, p: Params, index_df=None, trades_df=None, split=None):
+def run_one(sym: str, df: pd.DataFrame, out: str, p: Params, index_df=None, trades_df=None, split=None,
+            sens: bool = False):
     sc = WyckoffScanner(df, p).run()
     os.makedirs(out, exist_ok=True)
     ev, sig, trs = sc.events_df(), sc.signals_df(), sc.trs_df()
@@ -114,6 +154,15 @@ def run_one(sym: str, df: pd.DataFrame, out: str, p: Params, index_df=None, trad
             t["period"] = np.where(pd.to_datetime(t["entry_date"]) < pd.Timestamp(split), "in_sample", "out_sample")
             for per, g in t.groupby("period"):
                 res[f"{per}_trades"], res[f"{per}_avg_net"] = len(g), float(g["net_ret"].mean())
+    # 週線過濾比較（同一次掃描，只改回測的進場條件）
+    t_wf = backtest(sc, weekly_filter=True)
+    t_wf.to_csv(f"{out}/trades_weekly_filter.csv", index=False, encoding="utf-8-sig")
+    res.update({f"wf_{k}": v for k, v in sums_to_stats(trade_sums(t_wf)).items()})
+    res["_sums_all"], res["_sums_wf"] = trade_sums(t), trade_sums(t_wf)
+    if sens:
+        sv = sensitivity(df, p)
+        sv.to_csv(f"{out}/sensitivity.csv", index=False, encoding="utf-8-sig")
+        res["_sens"] = sv
     if index_df is not None:
         rs = relative_strength(df, index_df)
         rs.to_csv(f"{out}/relative_strength.csv", index=False, encoding="utf-8-sig")
@@ -132,6 +181,7 @@ def main():
     ap.add_argument("--index", default=None, help="大盤 CSV（相對強弱）")
     ap.add_argument("--trades", default=None, help="使用者買賣紀錄 CSV")
     ap.add_argument("--split", default=None, help="樣本內/外分界日，如 2018-01-01")
+    ap.add_argument("--sensitivity", action="store_true", help="執行主要參數 ±20% 的單變數穩健性測試（較慢）")
     a = ap.parse_args()
     p = Params()
     files = sorted({f for pat in a.csv for f in glob.glob(pat)})
@@ -151,7 +201,7 @@ def main():
                 print(f"[略過] {f}:{sym} 資料少於 150 根")
                 continue
             name = sym if sym != "UNKNOWN" else os.path.splitext(os.path.basename(f))[0]
-            r, t = run_one(name, df, os.path.join(a.out, name), p, index_df, trades_df, a.split)
+            r, t = run_one(name, df, os.path.join(a.out, name), p, index_df, trades_df, a.split, a.sensitivity)
             rows.append(r)
             if len(t):
                 t.insert(0, "symbol", name)
@@ -161,13 +211,27 @@ def main():
         print("沒有可分析的資料。")
         return
     os.makedirs(a.out, exist_ok=True)
-    summ = pd.DataFrame(rows)
+    priv = [k for k in ("_sums_all", "_sums_wf", "_sens")]
+    summ = pd.DataFrame([{k: v for k, v in r.items() if k not in priv} for r in rows])
     summ.to_csv(os.path.join(a.out, "summary_by_symbol.csv"), index=False, encoding="utf-8-sig")
     lines = ["# 威科夫訊號驗證總表", "", f"- 檔案數：{len(files)}；股票數：{len(rows)}", ""]
     if all_t:
         T = pd.concat(all_t, ignore_index=True)
         T.to_csv(os.path.join(a.out, "all_trades.csv"), index=False, encoding="utf-8-sig")
         lines += ["## 各訊號交易統計（含交易成本）", "", to_md(summarize_trades(T)), ""]
+    # 週線過濾比較
+    agg = lambda key: {k: sum(r[key][k] for r in rows) for k in rows[0][key]}
+    wf_tab = pd.DataFrame([dict(版本="不過濾", **sums_to_stats(agg("_sums_all"))),
+                           dict(版本="過濾逆週線背景的多方訊號", **sums_to_stats(agg("_sums_wf")))])
+    lines += ["## 週線背景過濾比較〔p147、p225〕", "", to_md(wf_tab, index=False), ""]
+    # 參數穩健性
+    if a.sensitivity and all("_sens" in r for r in rows):
+        S = pd.concat([r["_sens"].assign(symbol=r["symbol"]) for r in rows], ignore_index=True)
+        S.to_csv(os.path.join(a.out, "sensitivity_all.csv"), index=False, encoding="utf-8-sig")
+        g = S.groupby(["param", "value"], sort=False)[["trades", "sum_net", "wins", "sum_R", "n_R"]].sum().reset_index()
+        st = pd.DataFrame([dict(param=x.param, value=x.value, **sums_to_stats(x._asdict())) for x in g.itertuples(index=False)])
+        lines += ["## 參數穩健性（單變數 ±20%）", "", to_md(st, index=False), "",
+                  "> 判讀：各變體的平均淨報酬與勝率應與基準接近且方向一致；若只有基準有效、稍一調整就轉負，代表過度擬合。", ""]
     lines += ["## 各股摘要（含隨機進場基準）", "", to_md(summ, index=False), "",
               "> 判讀：策略平均淨報酬應明顯高於 rand_avg_net_mean，最好高於 rand_avg_net_p95，"
               "且樣本外（out_sample）不顯著劣化，才算有效。"]

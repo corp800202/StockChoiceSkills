@@ -14,7 +14,8 @@ import numpy as np
 import pandas as pd
 
 from wyckoff_engine import (Params, WyckoffScanner, add_features, bar_signals, backtest,
-                            snapshot, audit_trades, load_ohlcv_csv, summarize_trades, event_study)
+                            snapshot, audit_trades, load_ohlcv_csv, summarize_trades, event_study,
+                            zigzag, channels, to_weekly, weekly_context, pnf_columns, cause_target)
 
 
 class Builder:
@@ -246,6 +247,131 @@ class TestNoiseSanity(unittest.TestCase):
         ds = b["demand_score"].dropna()
         self.assertTrue(((ds >= 0) & (ds <= 100)).all())
         self.assertTrue(b["ud_vol_ratio"].dropna().gt(0).all())
+
+
+def make_channel_series():
+    """暖身 → 帶波動的上升通道 → 放量跌破需求線 → 帶波動且振幅漸增的下降通道 → 放量突破供應線"""
+    b = Builder(100.0)
+    b.path(60, 100.0, 0.02, 0.5, 1e6, wiggle=0.005)
+    m = {}
+    start = b.last
+    for k in range(1, 97):                                    # 上升通道：線性上漲 + 正弦波動
+        c = start * (1 + 0.004 * k) * (1 + 0.035 * np.sin(2 * np.pi * k / 16))
+        b.bar(c, 0.02, 0.5, 1e6)
+    m["up_end"] = len(b.rows) - 1
+    for f in (0.96, 0.955, 0.95):                              # 放量跌破
+        b.bar(b.last * f, 0.04, 0.15, 2.6e6)
+    m["break_dn"] = (m["up_end"] + 1, len(b.rows) - 1)
+    start = b.last
+    for k in range(1, 97):                                    # 下降通道：振幅漸增，後面的低點會跌破超賣線
+        amp = 0.03 + 0.0004 * k
+        c = start * (1 - 0.004 * k) * (1 + amp * np.sin(2 * np.pi * k / 16))
+        b.bar(c, 0.02, 0.5, 1e6)
+    m["down_end"] = len(b.rows) - 1
+    for f in (1.05, 1.05, 1.05):                               # 放量突破
+        b.bar(b.last * f, 0.045, 0.85, 2.6e6)
+    m["break_up"] = (m["down_end"] + 1, len(b.rows) - 1)
+    b.path(30, b.last * 1.05, 0.02, 0.5, 1.1e6)
+    return b.df(), m
+
+
+class TestChannels(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.df, cls.m = make_channel_series()
+        d = add_features(cls.df)
+        cls.ch = channels(d, zigzag(d, 2.0))
+        cls.ev = pd.DataFrame(cls.ch["events"])
+
+    def _has(self, kind, rng, strong=None):
+        e = self.ev[(self.ev["kind"] == kind) & self.ev["confirm"].between(*rng)]
+        if strong is not None:
+            e = e[e["strong"] == strong]
+        return not e.empty
+
+    def test_up_channel_and_demand_line_break(self):
+        a, z = self.m["break_dn"]
+        self.assertTrue((self.ch["dir"][self.m["up_end"] - 5:self.m["up_end"]] == "up").all(), "未形成上升通道")
+        self.assertTrue(self._has("DEMAND_LINE_BREAK", (a, z + 2), strong=True), "放量跌破需求線未偵測")
+
+    def test_down_channel_oversold_and_supply_break(self):
+        a, z = self.m["break_up"]
+        self.assertTrue(self._has("OVERSOLD", (self.m["break_dn"][1], self.m["down_end"])), "觸及超賣線未偵測")
+        self.assertTrue(self._has("SUPPLY_LINE_BREAK", (a, z + 2), strong=True), "放量突破供應線未偵測")
+
+    def test_trendline_exit_signal(self):
+        sc = WyckoffScanner(self.df).run()
+        s = sc.signals_df()
+        a, z = self.m["break_dn"]
+        self.assertTrue(((s["kind"] == "X_TRENDLINE") & s["idx"].between(a, z + 2)).any(), "缺少 X_TRENDLINE 出場訊號")
+        card = snapshot(sc)
+        self.assertIn("channel", card)
+
+
+class TestCausality(unittest.TestCase):
+    """把資料截在第 t 根重跑：t-1 之前確認的事件與訊號必須和完整資料完全相同（無未來函數）。"""
+
+    def _key_events(self, sc, upto):
+        e = sc.events_df()
+        e = e[e["confirm"] < upto]
+        return sorted((r.kind, int(r.idx), int(r.confirm), round(float(r.price), 6)) for r in e.itertuples())
+
+    def _key_signals(self, sc, upto):
+        s = sc.signals_df()
+        if s.empty:
+            return []
+        s = s[s["idx"] < upto]
+        return sorted((r.kind, int(r.idx), round(float(r.stop), 6) if r.stop == r.stop else None) for r in s.itertuples())
+
+    def test_truncation_invariance(self):
+        for df in (make_cycle()[0], random_walk(11, 900)):
+            full = WyckoffScanner(df).run()
+            for t in (len(df) // 2, int(len(df) * 0.75), len(df) - 15):
+                part = WyckoffScanner(df.iloc[:t].reset_index(drop=True)).run()
+                self.assertEqual(self._key_events(full, t - 1), self._key_events(part, t - 1), f"事件在 t={t} 不一致")
+                self.assertEqual(self._key_signals(full, t - 1), self._key_signals(part, t - 1), f"訊號在 t={t} 不一致")
+                np.testing.assert_array_equal(full.ch["lower"][:t], part.ch["lower"][:t])
+                self.assertTrue((full.wk["wk_ok_long"].iloc[:t - 1].to_numpy() == part.wk["wk_ok_long"].iloc[:t - 1].to_numpy()).all())
+
+
+class TestWeeklyAndPnf(unittest.TestCase):
+    def test_to_weekly_and_mapping(self):
+        dates = pd.bdate_range("2024-01-01", periods=10)            # 週一～週五 ×2
+        df = pd.DataFrame(dict(date=dates, open=np.arange(10) + 10.0, high=np.arange(10) + 11.0,
+                               low=np.arange(10) + 9.0, close=np.arange(10) + 10.5, volume=[100.0] * 10))
+        w = to_weekly(df)
+        self.assertEqual(len(w), 2)
+        self.assertEqual(w.at[0, "open"], 10.0)
+        self.assertEqual(w.at[0, "close"], 14.5)
+        self.assertEqual(w.at[0, "high"], 15.0)
+        self.assertEqual(w.at[0, "volume"], 500.0)
+        self.assertEqual(str(w.at[0, "date"])[:10], "2024-01-05")
+
+    def test_weekly_context_no_lookahead_alignment(self):
+        df = random_walk(3, 700)
+        wk, wsc = weekly_context(add_features(df))
+        self.assertEqual(len(wk), len(df))
+        wb = wsc.bars_df()
+        # 週三（未完成的週）只能用上一個已完成週的狀態
+        d = pd.to_datetime(df["date"])
+        i = int(np.where(d.dt.weekday == 2)[0][60])
+        prev_week_end = wb["date"][pd.to_datetime(wb["date"]) < d[i]].max()
+        expect = wb.loc[pd.to_datetime(wb["date"]) == prev_week_end, "phase"].iloc[0]
+        self.assertEqual(wk.at[i, "wk_phase"], expect)
+
+    def test_pnf_columns(self):
+        cols = pnf_columns([10, 11, 12, 13, 12, 11, 10, 11, 12, 13, 14], box=1.0, reversal=3)
+        self.assertEqual([c["dir"] for c in cols], ["X", "O", "X"])
+        self.assertEqual(cols[0]["top"], 13.0)
+        self.assertEqual(cols[2]["top"], 14.0)
+
+    def test_cause_target(self):
+        df, m = make_cycle()
+        sc = WyckoffScanner(df).run()
+        acc = [t for t in sc.trs if t.result.startswith("吸籌")][0]
+        ct = cause_target(sc, acc)
+        self.assertGreater(ct["columns"], 0)
+        self.assertGreater(ct["bull_from_support"], acc.support)
 
 
 class TestCsvLoader(unittest.TestCase):
