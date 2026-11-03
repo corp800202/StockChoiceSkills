@@ -101,6 +101,23 @@ class Params:
     # 多時間框架：由日 K 合成週 K 作為大背景〔p31、p127、p146、p268–272〕
     use_weekly: bool = True
     weekly_filter: bool = False      # True：週線仍在下跌且尚未形成區間時，不採用日線多方訊號〔p147、p225〕
+    # v1.2：趨勢回調進場（書中的「最小可行系統」〔p316〕：牛市＋需要的回調＋停止行為扣扳機）
+    pb_lookback: int = 40            # 近 40 根最高點視為這一波的高點【延伸】
+    pb_min_leg_atr: float = 3.0      # 上漲腿至少 3 ATR 才算一波【延伸】
+    pb_max_retr: float = 0.5         # 【原書 p143–146、p187】回調不超過上漲腿 50%
+    pb_max_age: int = 25             # 高點之後最多 25 根仍視為回調【延伸】
+    pb_zone_atr: float = 0.75        # 支撐區寬度【延伸】
+    pb_ud_min: float = 1.1           # 近 20 日上漲日量／下跌日量【原書 p316 概念，門檻為延伸】
+    pb_max_risk_atr: float = 3.5     # 進場到停損超過 3.5 ATR 則放棄【延伸】
+    pb_cooldown: int = 8
+    # v1.2：死角交易法〔p114、p233、p290〕
+    corner_demand_min: float = 55.0
+    corner_range_pos_max: float = 0.45
+    corner_rvol_max: float = 0.8
+    # v1.2：持有期間的出場規則（回測用）
+    exit_on_stall: bool = True       # 【原書 p59–60】放量滯漲後次日量縮 → 清倉最後時機
+    tighten_on_sot: bool = True      # 【原書 p141】SOT／通道式 SOT／波段放量滯漲／回調>50% → 縮緊停損
+    exit_on_sot_retr: bool = True    # 【原書 p145–146】SOT 與回調>50% 先後出現 → 離場
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +402,38 @@ def pivot_warnings(d: pd.DataFrame, piv: list) -> list:
     return out
 
 
+def wave_events(d: pd.DataFrame, piv: list) -> list:
+    """波段層級的努力與結果〔p60–62、p187、p222〕（只用已確認的轉折點）。
+
+    WAVE_STALL_UP   上漲波累積量 >= 前 2~3 個上漲波的平均，高點卻沒有超過前一個上漲波高點
+                    ＝放量滯漲，原書稱「這是個警告」（CM 出貨）〔p60〕；只在上升背景記錄。
+    WAVE_STALL_DOWN 下跌波累積量 >= 前 2~3 個下跌波的平均，低點卻沒有跌破前一個下跌波低點
+                    ＝放量滯跌（需求在吸收供應）〔p60、p222〕；只在下降或區間背景記錄。
+    """
+    w = waves(d, piv)
+    out = []
+    if w.empty:
+        return out
+    reg = d["regime"].to_numpy()
+    ups, dns = [], []
+    for r in w.itertuples():
+        same = ups if r.dir == "up" else dns
+        if len(same) >= 2:
+            avg_v = float(np.mean([x.wave_vol for x in same[-3:]]))
+            if avg_v > 0 and r.wave_vol >= avg_v:
+                ratio = r.wave_vol / avg_v
+                if r.dir == "up" and r.p1 <= same[-1].p1 and reg[r.confirm] == "up":
+                    out.append(dict(idx=int(r.end), confirm=int(r.confirm), kind="WAVE_STALL_UP", price=float(r.p1),
+                                    note=f"上漲波累積量為前幾波的 {ratio:.1f} 倍，卻沒有創新高：放量滯漲（CM 出貨的警告）",
+                                    page="p60-62,p187"))
+                elif r.dir == "down" and r.p1 >= same[-1].p1 and reg[r.confirm] in ("down", "range"):
+                    out.append(dict(idx=int(r.end), confirm=int(r.confirm), kind="WAVE_STALL_DOWN", price=float(r.p1),
+                                    note=f"下跌波累積量為前幾波的 {ratio:.1f} 倍，卻沒有創新低：放量滯跌（需求在吸收供應）",
+                                    page="p60-62,p222"))
+        same.append(r)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 通道線（超買線／超賣線／供應線／需求線）
 # ---------------------------------------------------------------------------
@@ -534,18 +583,21 @@ def weekly_context(df: pd.DataFrame, p: Params = Params()):
     w = to_weekly(df)
     n = len(df)
     empty = pd.DataFrame({"wk_regime": [""] * n, "wk_phase": [""] * n, "wk_bias": [0.0] * n, "wk_ok_long": [True] * n})
-    if len(w) < 40:
+    if len(w) < 10:
         return empty, None
     wsc = WyckoffScanner(w, weekly_params(p)).run()
     wb = wsc.bars_df()[["date", "regime", "phase", "bias"]].rename(
         columns={"regime": "wk_regime", "phase": "wk_phase", "bias": "wk_bias"})
     wb["date"] = pd.to_datetime(wb["date"])
+    wb["wk_n"] = np.arange(1, len(wb) + 1)                      # 截至該週已累積的週 K 根數
     left = pd.DataFrame({"date": pd.to_datetime(df["date"]).to_numpy(), "_i": np.arange(n)})
     m = pd.merge_asof(left.sort_values("date"), wb.sort_values("date"), on="date", direction="backward")
     m = m.sort_values("_i").reset_index(drop=True)
-    m["wk_regime"] = m["wk_regime"].fillna("")
-    m["wk_phase"] = m["wk_phase"].fillna("")
-    m["wk_bias"] = m["wk_bias"].fillna(0.0)
+    # 當時累積不足 40 週：週線背景視為「未知」（逐日判斷，不受整份資料長度影響）
+    unknown = m["wk_n"].isna() | (m["wk_n"] < 40)
+    m["wk_regime"] = m["wk_regime"].where(~unknown, "").fillna("")
+    m["wk_phase"] = m["wk_phase"].where(~unknown, "").fillna("")
+    m["wk_bias"] = m["wk_bias"].where(~unknown, 0.0).fillna(0.0)
     m["wk_ok_long"] = ~((m["wk_regime"] == "down") & (m["wk_phase"].isin(["", "A", "E"])))
     return m[["wk_regime", "wk_phase", "wk_bias", "wk_ok_long"]], wsc
 
@@ -654,6 +706,8 @@ EVENT_PAGES = {
     "LPSY": "p152,p156", "SOW失效": "p161", "MarkupE": "p92,p98", "MarkdownE": "p148,p156",
     "OVERSOLD": "p65,p263-264", "SUPPLY_LINE_BREAK": "p65,p112,p132", "OVERBOUGHT": "p38,p98,p235",
     "DEMAND_LINE_BREAK": "p142,p146,p270", "SOT_CH_UP": "p142-143,p186", "SOT_CH_DOWN": "p132,p142",
+    "PB": "p316,p31,p39-40,p239-244,p248-251", "CORNER": "p65,p114,p233,p290",
+    "NoDemandRally": "p229-231,p253,p272-273,p284", "WAVE_STALL_UP": "p60-62,p187", "WAVE_STALL_DOWN": "p60-62,p222",
 }
 
 
@@ -706,13 +760,14 @@ class WyckoffScanner:
             tr.bias += w
         return e
 
-    def _sig(self, i, kind, side, stop=NaN, note="", page="", tr=None):
-        tr = tr if tr is not None else self.tr
+    def _sig(self, i, kind, side, stop=NaN, note="", page="", tr=None, tr_id=None):
+        # tr_id 明確指定時（例如趨勢回調訊號，不隸屬任何區間），不回退到「目前區間」
+        tr = tr if tr is not None else (None if tr_id is not None else self.tr)
         if side == "long" and self.wk is not None and not bool(self.wk.at[int(i), "wk_ok_long"]):
             note += "；⚠ 週線仍在下跌且尚未形成區間，逆大背景〔p147、p225〕"
         self.signals.append(dict(idx=int(i), date=self.d.at[int(i), "date"] if "date" in self.d else i,
                                  kind=kind, side=side, stop=float(stop), note=note, page=page,
-                                 tr_id=(tr.id if tr else -1)))
+                                 tr_id=(tr_id if tr_id is not None else (tr.id if tr else -1))))
 
     def _row(self, i):
         d = self.d
@@ -1124,10 +1179,12 @@ class WyckoffScanner:
                         done = True                                      # 回測太深，放棄
                     else:
                         pull.clear()
-            elif st["kind"] == "LPSY":                                 # SOW/破冰後的無量反彈〔p152、p156〕
+            elif st["kind"] == "LPSY":     # SOW/破冰後的無量反彈〔p152、p156〕；跌破需求線後的無需求反彈〔p229–231〕
                 rally = st["rally"]
+                nd = st.get("sig_kind") == "S_NODEMAND"
                 if s.at[i, "demand_bar"] and c > st["ref_hi"]:
-                    self._ev(i, i, "SOW失效", c, "SOW 後出現放量長陽收復：新需求進場，SOW 失效〔p161〕", tr, 2.0)
+                    if not nd:
+                        self._ev(i, i, "SOW失效", c, "SOW 後出現放量長陽收復：新需求進場，SOW 失效〔p161〕", tr, 2.0)
                     done = True
                 elif c > d.at[i - 1, "close"]:
                     rally.append(i)
@@ -1135,10 +1192,17 @@ class WyckoffScanner:
                     rv = d["rvol"].iloc[rally].mean()
                     rhi = d["high"].iloc[rally].max()
                     if rv <= 0.9 and rhi <= st["ref_hi"] + 0.25 * atr:
-                        self._ev(rally[int(np.argmax(d["high"].iloc[rally].to_numpy()))], i, "LPSY", rhi,
-                                 f"弱勢反彈（均量 {rv:.1f}×）無法收復：最後派發點＝最佳做空點／最後逃命點", tr, -2.0)
-                        self._sig(i, "S_LPSY", "short", rhi + p.stop_buffer_atr * atr,
-                                  "LPSY：多單最後出場點；可放空者停損放在反彈高點上方", "p152,p156", tr)
+                        top = rally[int(np.argmax(d["high"].iloc[rally].to_numpy()))]
+                        if nd:
+                            self._ev(top, i, "NoDemandRally", rhi,
+                                     f"跌破需求線後的無需求反彈（均量 {rv:.1f}×）無法收復破位：供應背景下的反彈", tr, -1.0)
+                            self._sig(i, "S_NODEMAND", "short", rhi + p.stop_buffer_atr * atr,
+                                      "無需求反彈：多單出場、不搶反彈；放空者停損放在反彈高點上方", "p229-231,p253,p273", tr)
+                        else:
+                            self._ev(top, i, "LPSY", rhi,
+                                     f"弱勢反彈（均量 {rv:.1f}×）無法收復：最後派發點＝最佳做空點／最後逃命點", tr, -2.0)
+                            self._sig(i, "S_LPSY", "short", rhi + p.stop_buffer_atr * atr,
+                                      "LPSY：多單最後出場點；可放空者停損放在反彈高點上方", "p152,p156", tr)
                         fired.add(group(st))
                         done = True
                     else:
@@ -1163,16 +1227,178 @@ class WyckoffScanner:
             if k == "SUPPLY_LINE_BREAK" and strong:
                 w = 1.0 if (tr is not None and tr.prior == "down") else 0.5   # 驗證 SC 形成的臨時支撐〔p112〕
             elif k == "DEMAND_LINE_BREAK":
-                w = -1.0 if strong else -0.3
+                w = -1.0 if strong else 0.0     # 未放量的跌破只是資訊（區間內的小通道常被震盪穿越）
             elif k == "SOT_CH_UP":
                 w = -0.5
             elif k == "SOT_CH_DOWN":
                 w = 0.5
             self._ev(e["idx"], e["confirm"], k, e["price"], e["note"], tr, w)
-            if k == "DEMAND_LINE_BREAK" and strong and self.p.exit_on_demand_line_break:
-                self._sig(i, "X_TRENDLINE", "exit", NaN, "放量跌破需求線（上升趨勢線）：無論盈虧離場", "p142,p146", tr)
+            if k == "DEMAND_LINE_BREAK" and strong:
+                if self.p.exit_on_demand_line_break:
+                    self._sig(i, "X_TRENDLINE", "exit", NaN, "放量跌破需求線（上升趨勢線）：無論盈虧離場", "p142,p146", tr)
+                # 之後若出現無需求反彈（量縮、收不回破位），發出 S_NODEMAND〔p229–231、p272–273〕
+                hi3 = float(self.d["high"].iloc[max(0, i - 2):i + 1].max())
+                self.setups.append(dict(kind="LPSY", start=i, ref=hi3, ref_hi=hi3, tr=tr, rally=[],
+                                        exp=i + self.p.lpsy_max_bars, sig_kind="S_NODEMAND"))
             elif k == "SOT_CH_UP":
                 self._sig(i, "W_SOT_CH", "warn", NaN, e["note"], e["page"], tr)
+
+    # ---------------- v1.2：趨勢回調進場（書中的最小可行系統〔p316〕）----------------
+    def _pullback_pass(self):
+        """牛市回調進場，不需要先有交易區間。全部只用當根以前的資料。
+
+        ① 背景：50 日均線上升且收盤不低於均線 0.5 ATR，近 20 日上漲日量／下跌日量 >= pb_ud_min（需求占上風）〔p316〕
+        ② 需要的回調：自近 40 根高點回落不超過上漲腿 50%〔p143–146〕；回調中沒有放量長陰或垂直供應柱
+           （回調沒有引起供應擴大〔p28〕）；回調 K 線平均量與振幅不高於均值（小蠟燭、小成交量〔p316〕）；
+           20 根內沒有搶購高潮〔p116–117〕
+        ③ 支撐區：垂直需求柱底部〔p31、p39–40、p248–251〕、突破點（前高變支撐）〔p98、p111、p241〕、
+           需求線〔p269–270〕、上漲腿 50% 位置〔p239–240〕
+        ④ 扣扳機＝停止行為〔p316〕：跌破支撐區後收回（Spring）、放量滯跌、長下影放量、縮量小蠟燭（無供應）、
+           下跌推進幅度縮小（SOT）
+        停損：觸發 K 線低點與支撐結構點兩者較低者之下〔p36、p224、p289〕。
+        """
+        p, d, s = self.p, self.d, self.s
+        n = len(d)
+        if n < 70:
+            return
+        h, l, c = (d[k].to_numpy(float) for k in ("high", "low", "close"))
+        atr = d["atr"].to_numpy(float)
+        rvol = d["rvol"].to_numpy(float)
+        rsp = d["rspread"].to_numpy(float)
+        cpos = d["close_pos"].to_numpy(float)
+        sma = d["sma"].to_numpy(float)
+        slope = d["sma_slope"].to_numpy(float)
+        lim = d["limit_move"].fillna(False).to_numpy(bool)
+        udr = wyckoff_indicators(d, s)["ud_vol_ratio"].to_numpy(float)
+        f = {k: s[k].to_numpy(bool) for k in ("vdb", "vsb", "supply_bar", "stop1_down", "stop2_down", "no_supply")}
+        bc_conf = np.array(sorted(e["confirm"] for e in self.events if e["kind"] == "BC"), dtype=int)
+        W, last, last_stop = p.pb_lookback, -10 ** 9, None
+        for i in range(max(W, 60), n):
+            if last_stop is not None and l[i] < last_stop:
+                last, last_stop = -10 ** 9, None      # 前一個訊號已被否定（跌破停損）→ 等下一次測試〔p223〕
+            a = atr[i]
+            if lim[i] or not np.isfinite(a) or a <= 0 or i - last < p.pb_cooldown:
+                continue
+            if not (slope[i] > 0 and c[i] >= sma[i] - 0.5 * a):                    # 牛市背景
+                continue
+            seg = h[i - W + 1:i + 1]
+            hh_i = i - W + 1 + (len(seg) - 1 - int(np.argmax(seg[::-1])))         # 最近一次的最高點
+            if not (2 <= i - hh_i <= p.pb_max_age):
+                continue
+            b0 = max(0, hh_i - W)
+            base_i = b0 + int(np.argmin(l[b0:hh_i + 1]))
+            hh, base = h[hh_i], l[base_i]
+            leg = hh - base
+            if base_i >= hh_i or leg < p.pb_min_leg_atr * a:
+                continue
+            retr = (hh - float(np.min(l[hh_i + 1:i + 1]))) / leg
+            if retr > p.pb_max_retr:
+                continue
+            if f["vsb"][hh_i + 1:i + 1].any() or f["supply_bar"][hh_i + 1:i + 1].any():
+                continue
+            if not (udr[i] >= p.pb_ud_min):
+                continue
+            q = slice(hh_i + 1, i)                                                 # 回調品質（不含觸發 K）
+            if np.nanmean(rvol[q]) > 1.0 or np.nanmean(rsp[q]) > 1.0:
+                continue
+            if len(bc_conf) and ((bc_conf >= i - 20) & (bc_conf <= i)).any():
+                continue
+            z = p.pb_zone_atr * a
+            zones = []
+            js = np.where(f["vdb"][base_i:hh_i + 1])[0]
+            if len(js):
+                j = base_i + int(js[-1])
+                zones.append(("垂直需求柱底部", l[j] - z, l[j] + z, l[j], "p31,p39-40,p248-251"))
+            prev_hi = float(np.max(h[max(0, base_i - W):base_i + 1]))
+            if hh > prev_hi + 0.5 * a:
+                zones.append(("突破點（前高變支撐）", prev_hi - z, prev_hi + z, prev_hi - 0.5 * a, "p98,p111,p241"))
+            if self.ch["dir"][i] == "up" and np.isfinite(self.ch["lower"][i]):
+                lv = float(self.ch["lower"][i])
+                zones.append(("需求線（上升趨勢線）", lv - z, lv + z, lv - 0.5 * a, "p269-270"))
+            mid = hh - 0.5 * leg
+            zones.append(("上漲腿 50% 位置", mid - z, mid + z, None, "p143-146,p239-240"))
+            # 原書最小可行系統〔p316〕不要求特定支撐；回調在 25%～50% 之間即屬健康回調〔p143–146〕
+            zones.append(("健康回調區（上漲腿 25%～50%）", hh - 0.5 * leg, hh - 0.25 * leg, None, "p143-146,p316"))
+            sot = l[i] < l[i - 1] < l[i - 2] and (l[i - 1] - l[i]) <= 0.5 * (l[i - 2] - l[i - 1]) and rvol[i] <= 1.0
+            hit = None
+            for name, zlo, zhi, anchor, page in zones:
+                inside = zlo <= l[i] <= zhi
+                pierced = l[i] < zlo and l[i] >= zlo - a and c[i] >= zlo and cpos[i] >= 0.5 and rsp[i] <= 1.5
+                if pierced:
+                    trig = ("跌破支撐區後收回（Spring）", "p66,p194-197")
+                elif not inside:
+                    continue
+                elif f["stop2_down"][i]:
+                    trig = ("放量滯跌（努力沒有結果）", "p46,p80,p239")
+                elif f["stop1_down"][i]:
+                    trig = ("長下影線＋放量的停止行為", "p78")
+                elif f["no_supply"][i] and rvol[i] <= p.vol_low:
+                    trig = ("縮量小蠟燭回調（無供應）", "p36,p100,p111")
+                elif sot:
+                    trig = ("下跌推進幅度縮小（SOT）", "p137,p242")
+                else:
+                    continue
+                hit = (name, anchor, page, trig)
+                break
+            if hit is None:
+                continue
+            name, anchor, page, (tname, tpage) = hit
+            stop = min(l[i], anchor if anchor is not None else l[i]) - p.stop_buffer_atr * a
+            if c[i] <= stop or c[i] - stop > p.pb_max_risk_atr * a:
+                continue
+            note = f"多頭回調到{name}出現{tname}（回調 {retr:.0%}、回調均量 {np.nanmean(rvol[q]):.1f}×）"
+            pages = f"p316,{page},{tpage}"
+            self.events.append(dict(idx=i, confirm=i, date=d.at[i, "date"] if "date" in d else i, kind="PB",
+                                    price=float(l[i]), tr_id=-1, note=note, page=pages))
+            self._sig(i, "L_PULLBACK", "long", stop, note + "；停損放在觸發K線與支撐結構的低點之下", pages, tr_id=-1)
+            last, last_stop = i, stop
+
+    # ---------------- v1.2：死角交易法〔p114、p233、p290〕----------------
+    def _corner_pass(self):
+        """需求背景下，價格在近期區間的下半部「進入死角」（高點遞降、低點遞升、振幅收斂、量能萎縮）。
+        原書：死角是進場的最好時機，扣扳機的依據是市場進入死角這個現象本身〔p114〕；
+        死角的突破方向由背景決定，需求大於供應時向上〔p233、p290〕。停損放在死角最低點之下【延伸】。"""
+        p, d, s = self.p, self.d, self.s
+        n = len(d)
+        if n < 70:
+            return
+        ind = wyckoff_indicators(d, s)
+        dc = ind["dead_corner"].fillna(False).to_numpy(bool)
+        ds = ind["demand_score"].to_numpy(float)
+        rp = ind["range_pos"].to_numpy(float)
+        dry = ind["dry_up"].to_numpy(float)
+        l, c = d["low"].to_numpy(float), d["close"].to_numpy(float)
+        v, sp = d["volume"].to_numpy(float), d["spread"].to_numpy(float)
+        atr = d["atr"].to_numpy(float)
+        reg = d["regime"].to_numpy()
+        sup = (s["vsb"] | s["supply_bar"]).to_numpy(bool)
+        last = -10 ** 9
+        for i in range(60, n):
+            if not dc[i] or dc[i - 1] or i - last < 10 or not np.isfinite(atr[i]):
+                continue
+            bg = reg[i] == "up" or (self.bar_phase[i] in ("B", "C", "D") and self.bar_bias[i] >= 1.0)
+            if not (bg and rp[i] <= p.corner_range_pos_max and dry[i] <= p.corner_rvol_max):
+                continue
+            # 死角內的需求證據：上漲 K 的量與長度都大於下跌 K〔p290〕，或綜合需求分數夠高
+            w = slice(i - 9, i + 1)
+            upk = c[w] > np.r_[c[i - 10], c[i - 9:i]]
+            dnk = ~upk
+            corner_demand = (upk.any() and dnk.any() and v[w][upk].sum() > v[w][dnk].sum()
+                             and sp[w][upk].mean() >= sp[w][dnk].mean())
+            if not (corner_demand or ds[i] >= p.corner_demand_min):
+                continue
+            if sup[max(0, i - 10):i + 1].any():
+                continue
+            stop = float(np.min(l[i - 9:i + 1])) - p.stop_buffer_atr * atr[i]
+            if c[i] <= stop or c[i] - stop > 3.0 * atr[i]:
+                continue
+            note = (f"需求背景下進入死角（需求分數 {ds[i]:.0f}、近 5 日均量 {dry[i]:.1f}×、區間位置 {rp[i]:.0%}）："
+                    "供求都很弱，需求稍作努力即可向上突破")
+            tid = int(self.bar_tr[i])
+            self.events.append(dict(idx=i, confirm=i, date=d.at[i, "date"] if "date" in d else i, kind="CORNER",
+                                    price=float(c[i]), tr_id=tid, note=note, page="p65,p114,p233,p290"))
+            self._sig(i, "L_CORNER", "long", stop, note + "；停損放在死角最低點之下", "p114,p233,p290", tr_id=tid)
+            last = i
 
     # ---------------- 主迴圈 ----------------
     def run(self):
@@ -1204,12 +1430,22 @@ class WyckoffScanner:
         if self.tr is not None:
             self.tr.result = self.tr.result or "進行中"
             self.trs.append(self.tr)
+        dt = lambda j: self.d.at[j, "date"] if "date" in self.d else j
         # 波段層級警示（SOT、50%）
         for w in pivot_warnings(self.d, self.piv):
-            self.events.append(dict(idx=w["idx"], confirm=w["confirm"], date=self.d.at[w["idx"], "date"] if "date" in self.d else w["idx"],
+            self.events.append(dict(idx=w["idx"], confirm=w["confirm"], date=dt(w["idx"]),
                                     kind=w["kind"], price=float(self.d.at[w["idx"], "close"]), tr_id=-1, note=w["note"], page=w["page"]))
             if w["kind"] in ("SOT_up", "RETR_GT50") and self.d.at[w["confirm"], "regime"] == "up":
-                self._sig(w["confirm"], "W_" + w["kind"], "warn", NaN, w["note"], w["page"], None)
+                self._sig(w["confirm"], "W_" + w["kind"], "warn", NaN, w["note"], w["page"], tr_id=-1)
+        # v1.2：波段層級的努力與結果（放量滯漲／放量滯跌）
+        for w in wave_events(self.d, self.piv):
+            self.events.append(dict(idx=w["idx"], confirm=w["confirm"], date=dt(w["idx"]), kind=w["kind"],
+                                    price=w["price"], tr_id=-1, note=w["note"], page=w["page"]))
+            if w["kind"] == "WAVE_STALL_UP":
+                self._sig(w["confirm"], "W_WAVE_STALL_UP", "warn", NaN, w["note"], w["page"], tr_id=-1)
+        # v1.2：不依賴交易區間的進場（書中的最小可行系統、死角交易法）
+        self._pullback_pass()
+        self._corner_pass()
         return self
 
     def _record(self, i):
@@ -1227,12 +1463,15 @@ class WyckoffScanner:
                 self._last_resolved = None
 
     # ---------------- 輸出 ----------------
+    EVENT_COLS = ["idx", "confirm", "date", "kind", "price", "tr_id", "note", "page"]
+    SIGNAL_COLS = ["idx", "date", "kind", "side", "stop", "note", "page", "tr_id"]
+
     def events_df(self):
-        e = pd.DataFrame(self.events)
+        e = pd.DataFrame(self.events, columns=self.EVENT_COLS if not self.events else None)
         return e.sort_values(["confirm", "idx"]).reset_index(drop=True) if len(e) else e
 
     def signals_df(self):
-        s = pd.DataFrame(self.signals)
+        s = pd.DataFrame(self.signals, columns=self.SIGNAL_COLS if not self.signals else None)
         return s.sort_values("idx").reset_index(drop=True) if len(s) else s
 
     def trs_df(self):
@@ -1264,8 +1503,9 @@ class WyckoffScanner:
 # ---------------------------------------------------------------------------
 # 簡化回測（依原書進出場與危機管理規則）
 # ---------------------------------------------------------------------------
-LONG_KINDS = ("L_SPRING", "L_TEST", "L_LPS", "L_BU")
-EXIT_KINDS = ("X_ICE", "S_UT", "S_LPSY")
+LONG_KINDS = ("L_SPRING", "L_TEST", "L_LPS", "L_BU", "L_PULLBACK", "L_CORNER")
+EXIT_KINDS = ("X_ICE", "S_UT", "S_LPSY", "S_NODEMAND")
+TIGHTEN_KINDS = ("W_SOT_up", "W_SOT_CH", "W_WAVE_STALL_UP")
 
 
 def backtest(sc: WyckoffScanner, long_kinds=LONG_KINDS, exit_kinds=EXIT_KINDS, p: Optional[Params] = None,
@@ -1278,6 +1518,9 @@ def backtest(sc: WyckoffScanner, long_kinds=LONG_KINDS, exit_kinds=EXIT_KINDS, p
     - 確認後停損上移至最近已確認的波段低點（收緊停損〔p17、p141〕）。
     - 出現破冰／UT 確認／LPSY 訊號，下一根開盤出場；搶購高潮則停損上移到 BC 低點。
     - 確認後若放量跌破需求線（X_TRENDLINE），下一根開盤出場〔p142、p146〕。
+    - SOT／通道式 SOT／波段放量滯漲／回調超過 50% 的警示：停損縮緊到近 5 根最低點下〔p141〕；
+      SOT 類警示與回調超過 50% 在 10 根內先後出現：下一根開盤出場〔p145–146〕。
+    - 確認後出現放量滯漲（量增、振幅縮小）且次日量縮到 0.8 倍均量以下：當日收盤出場〔p59–60〕。
     - weekly_filter=True 時，週線仍在下跌且尚未形成區間的日子不接受多方訊號〔p147、p225〕。
     - 交易成本：買 0.1425%、賣 0.4425%（含證交稅）。
     """
@@ -1321,6 +1564,9 @@ def backtest(sc: WyckoffScanner, long_kinds=LONG_KINDS, exit_kinds=EXIT_KINDS, p
                     lows = [x for x in piv_lows if x["confirm"] <= i and x["idx"] > pos["entry_i"]]
                     if lows:
                         pos["stop"] = max(pos["stop"], lows[-1]["price"] - p.stop_buffer_atr * d.at[i, "atr"])
+                    # 放量滯漲後次日量縮：清倉的最後時機〔p59–60〕
+                    if p.exit_on_stall and i - 1 > pos["entry_i"] and s.at[i - 1, "stop2_up"] and d.at[i, "rvol"] <= 0.8:
+                        reason, px = "放量滯漲後量縮（清倉最後時機）", c
                 if reason is None and held >= p.max_hold:
                     reason, px = "持有期滿", c
             if reason is None:
@@ -1329,6 +1575,17 @@ def backtest(sc: WyckoffScanner, long_kinds=LONG_KINDS, exit_kinds=EXIT_KINDS, p
                         pos["exit_next"], pos["exit_reason"] = True, f"出場訊號 {r.kind}"
                     elif r.kind == "W_BC":
                         pos["stop"] = max(pos["stop"], d.at[i, "low"])
+                    elif r.kind in TIGHTEN_KINDS or r.kind == "W_RETR_GT50":
+                        if r.kind == "W_RETR_GT50":
+                            pos["last_retr"] = i
+                        else:
+                            pos["last_sot"] = i
+                        if p.tighten_on_sot:              # 縮緊停損〔p141〕
+                            lo5 = float(d["low"].iloc[max(pos["entry_i"], i - 4):i + 1].min())
+                            pos["stop"] = max(pos["stop"], lo5 - p.stop_buffer_atr * d.at[i, "atr"])
+                if (p.exit_on_sot_retr and not pos["exit_next"] and "last_sot" in pos and "last_retr" in pos
+                        and abs(pos["last_sot"] - pos["last_retr"]) <= 10):
+                    pos["exit_next"], pos["exit_reason"] = True, "SOT 與回調超過 50% 先後出現（立刻離場）"
             if reason is not None:
                 gross = px / pos["entry"] - 1
                 net = (px * (1 - p.sell_cost)) / (pos["entry"] * (1 + p.buy_cost)) - 1
@@ -1345,6 +1602,17 @@ def backtest(sc: WyckoffScanner, long_kinds=LONG_KINDS, exit_kinds=EXIT_KINDS, p
                 if r.kind in long_kinds and not math.isnan(r.stop):
                     pending = dict(idx=i, stop=r.stop, kind=r.kind)
                     break
+    if pos is not None:                                   # 資料結束時仍持有：以最後收盤價結算（標示為未平倉）
+        i = n - 1
+        px = d.at[i, "close"]
+        risk = pos["entry"] - pos["init_stop"]
+        atr_e = d.at[pos["entry_i"], "atr"]
+        trades.append(dict(kind=pos["kind"], entry_date=d.at[pos["entry_i"], "date"], entry=pos["entry"],
+                           init_stop=pos["init_stop"], risk_atr=risk / atr_e if atr_e > 0 else NaN,
+                           exit_date=d.at[i, "date"], exit=px, bars=i - pos["entry_i"] + 1,
+                           ret=px / pos["entry"] - 1,
+                           net_ret=(px * (1 - p.sell_cost)) / (pos["entry"] * (1 + p.buy_cost)) - 1,
+                           R=(px - pos["entry"]) / risk if risk > 0 else NaN, reason="資料結束（未平倉）"))
     return pd.DataFrame(trades)
 
 
@@ -1385,9 +1653,64 @@ def event_study(sc: WyckoffScanner, horizons=(5, 10, 20, 60)) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# 選股：相對強弱〔p253–258〕；部位：固定風險比例
+# ---------------------------------------------------------------------------
+def relative_strength(stock: pd.DataFrame, index: pd.DataFrame, lookback: int = 60) -> pd.DataFrame:
+    """原書的相對強弱選股〔p253–258〕：
+    ① 大盤創新低時，個股沒有創新低，且堅守在支撐上、回調未過 50%（rs_divergence）〔p253、p256 的 4/4a〕
+    ② 個股回調幅度明顯淺於大盤（例：大盤回落近 50%、個股僅 30%）（rs_shallower）〔p256 的 2/2a〕
+    ③ 大盤回升時個股漲幅更大：自大盤近 lookback 日最低點起算，個股報酬減大盤報酬（rs_out）〔p253〕
+    rs_strong＝近 lookback 日內出現過 ① 或 ②，且 ③ > 0、個股回調仍未過 50%。只用當日以前的資料。"""
+    m = stock[["date", "high", "low", "close"]].merge(
+        index[["date", "high", "low", "close"]], on="date", suffixes=("", "_idx")).reset_index(drop=True)
+    mp = max(5, lookback // 2)
+    m["rs_line"] = m["close"] / m["close_idx"]
+    m["idx_new_low"] = m["low_idx"] <= m["low_idx"].rolling(lookback, min_periods=mp).min()
+    m["stk_new_low"] = m["low"] <= m["low"].rolling(lookback, min_periods=mp).min()
+    for pre in ("", "_idx"):
+        hh = m["high" + pre].rolling(lookback, min_periods=mp).max()
+        ll = m["low" + pre].rolling(lookback, min_periods=mp).min()
+        m["retr" + pre] = (hh - m["close" + pre]) / (hh - ll).replace(0, np.nan)
+    m["rs_divergence"] = m["idx_new_low"] & ~m["stk_new_low"] & (m["retr"] < 0.5)
+    m["rs_shallower"] = (m["retr_idx"] - m["retr"]) >= 0.15
+    lo_idx = m["low_idx"].to_numpy(float)
+    cs, ci = m["close"].to_numpy(float), m["close_idx"].to_numpy(float)
+    out = np.full(len(m), NaN)
+    for t in range(len(m)):
+        a = max(0, t - lookback + 1)
+        j = a + int(np.argmin(lo_idx[a:t + 1]))
+        out[t] = (cs[t] / cs[j] - 1) - (ci[t] / ci[j] - 1)
+    m["rs_out"] = out
+    m["rs_score"] = (m["rs_divergence"] | m["rs_shallower"]).rolling(lookback, min_periods=1).sum()
+    m["rs_strong"] = (m["rs_score"] >= 1) & (m["rs_out"] > 0) & (m["retr"] < 0.5)
+    return m
+
+
+def position_size(equity: float, entry: float, stop: float, risk_pct: float = 0.01, lot_size: int = 1000,
+                  allow_odd_lot: bool = True, max_position_pct: float = 0.25, p: Params = Params()) -> dict:
+    """依結構停損計算股數【延伸：固定風險比例法】。
+    原書精神：低風險進場、停損時虧損最小〔p6、p27〕；先輕倉、需求跟隨再加碼〔p32、p288〕。
+    每股風險含來回交易成本；部位市值不超過淨值的 max_position_pct；台股一張 1,000 股，可選擇零股。"""
+    if not (equity > 0 and entry > stop > 0 and 0 < risk_pct < 1):
+        return dict(shares=0, lots=0, odd_shares=0, risk_per_share=NaN, risk_amount=0.0, position_value=0.0,
+                    note="參數不合理：需 淨值>0、進場價>停損價>0、0<風險比例<1")
+    rps = (entry - stop) + entry * p.buy_cost + stop * p.sell_cost
+    raw = int((equity * risk_pct) // rps)
+    raw = min(raw, int((equity * max_position_pct) // entry))
+    lots = raw // lot_size
+    odd = raw - lots * lot_size if allow_odd_lot else 0
+    shares = lots * lot_size + odd
+    return dict(shares=shares, lots=lots, odd_shares=odd, risk_per_share=round(rps, 4),
+                risk_amount=round(shares * rps, 2), position_value=round(shares * entry, 2),
+                risk_pct_of_equity=round(shares * rps / equity, 4),
+                note=f"單筆風險 {risk_pct:.1%}、部位上限 {max_position_pct:.0%}；分批時先買 1/3，需求跟隨再加碼〔p32、p288〕")
+
+
+# ---------------------------------------------------------------------------
 # StockExpert：診斷卡與交易紀錄檢討
 # ---------------------------------------------------------------------------
-def snapshot(sc: WyckoffScanner, lookback: int = 20, symbol: Optional[str] = None) -> dict:
+def snapshot(sc: WyckoffScanner, lookback: int = 20, symbol: Optional[str] = None,
+             index_df: Optional[pd.DataFrame] = None) -> dict:
     """最新一根 K 線的威科夫診斷卡（可直接轉 JSON 給前端）。"""
     d = sc.d
     i = len(d) - 1
@@ -1437,6 +1760,13 @@ def snapshot(sc: WyckoffScanner, lookback: int = 20, symbol: Optional[str] = Non
                               phase=w["wk_phase"] or "無有效區間", bias=num(w["wk_bias"]), ok_long=bool(w["wk_ok_long"]))
         if not bool(w["wk_ok_long"]):
             card["rule_reminders"].append("週線仍在下跌且尚未形成區間：熊市中不能隨意抄底〔p225〕")
+    if index_df is not None and "date" in d:
+        rs = relative_strength(d[["date", "high", "low", "close"]], index_df)
+        if len(rs):
+            r = rs.iloc[-1]
+            card["relative_strength"] = dict(rs_strong=bool(r["rs_strong"]), rs_score=num(r["rs_score"]),
+                                             stock_retr=num(r["retr"]), index_retr=num(r["retr_idx"]),
+                                             outperformance=num(r["rs_out"]), page="p253-258")
     return card
 
 
@@ -1461,13 +1791,15 @@ def audit_trades(sc: WyckoffScanner, trades: pd.DataFrame) -> pd.DataFrame:
         if side == "buy":
             if (just & {"Spring", "Test", "LPS", "BU"}) and not joc_today:
                 flags.append("✔ 買在原書進場點（Spring/測試/LPS/回測後 0~2 根）")
+            if just & {"PB", "CORNER"}:
+                flags.append("✔ 買在牛市回調的停止行為或死角（原書最小可行系統〔p316〕、死角交易法〔p114〕）")
             if ph == "B":
                 flags.append("✘ 在震盪區內部買進（原書：風險最大〔p93〕）")
             if joc_today:
                 flags.append("✘ 在 JOC 當天追價（原書：屬追高，應等縮量回測〔p202〕）")
             if kinds & {"BC", "PSY"}:
                 flags.append("✘ 搶購高潮附近買進（原書：危險、應等派發確認〔p116-117〕）")
-            if kinds & {"SOW", "ICE", "LPSY", "UT確認"}:
+            if kinds & {"SOW", "ICE", "LPSY", "UT確認", "NoDemandRally"}:
                 flags.append("✘ 供應控制背景下買進（原書：抢反弹是逆勢〔p147〕）")
             if d.at[i, "regime"] == "down" and ph not in ("B", "C", "D", "E"):
                 flags.append("△ 下降背景且尚未出現 SC/ST 構成的區間（原書：熊市不隨意抄底〔p225〕）")

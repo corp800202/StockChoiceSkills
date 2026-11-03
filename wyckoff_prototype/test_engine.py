@@ -13,9 +13,12 @@ import unittest
 import numpy as np
 import pandas as pd
 
+NaN = float("nan")
+
 from wyckoff_engine import (Params, WyckoffScanner, add_features, bar_signals, backtest,
                             snapshot, audit_trades, load_ohlcv_csv, summarize_trades, event_study,
-                            zigzag, channels, to_weekly, weekly_context, pnf_columns, cause_target)
+                            zigzag, channels, to_weekly, weekly_context, pnf_columns, cause_target,
+                            LONG_KINDS, wave_events, waves, relative_strength, position_size)
 
 
 class Builder:
@@ -228,7 +231,7 @@ class TestNoiseSanity(unittest.TestCase):
             sc = WyckoffScanner(df).run()
             t = backtest(sc)
             s = sc.signals_df()
-            n_sig += int(s["kind"].isin(["L_SPRING", "L_TEST", "L_LPS", "L_BU"]).sum()) if len(s) else 0
+            n_sig += int(s["kind"].isin(LONG_KINDS).sum()) if len(s) else 0
             n_bars += len(df)
             if len(t):
                 nets += list(t["net_ret"])
@@ -324,7 +327,7 @@ class TestCausality(unittest.TestCase):
         return sorted((r.kind, int(r.idx), round(float(r.stop), 6) if r.stop == r.stop else None) for r in s.itertuples())
 
     def test_truncation_invariance(self):
-        for df in (make_cycle()[0], random_walk(11, 900)):
+        for df in (make_cycle()[0], random_walk(11, 900), make_bull_pullback()[0], make_corner()[0]):
             full = WyckoffScanner(df).run()
             for t in (len(df) // 2, int(len(df) * 0.75), len(df) - 15):
                 part = WyckoffScanner(df.iloc[:t].reset_index(drop=True)).run()
@@ -372,6 +375,169 @@ class TestWeeklyAndPnf(unittest.TestCase):
         ct = cause_target(sc, acc)
         self.assertGreater(ct["columns"], 0)
         self.assertGreater(ct["bull_from_support"], acc.support)
+
+
+def make_bull_pullback(pb_end=118.0, trigger_close=117.0, supply_bar=False):
+    """暖身 → 垂直需求柱 → 上漲腿 → 縮量小蠟燭回調 → 停止行為 → 續漲（書中最小可行系統的情境〔p316〕）"""
+    b = Builder(100.0)
+    rng = np.random.default_rng(3)
+    b.path(70, 100.0, 0.02, 0.5, list(1e6 * (1 + 0.05 * rng.standard_normal(70))), wiggle=0.01, period=12)
+    m = {"vdb": b.bar(b.last * 1.05, 0.05, 0.9, 2.6e6)}
+    b.path(26, 130.0, 0.022, 0.65, 1.15e6, wiggle=0.004, period=9)
+    m["top"] = len(b.rows) - 1
+    vols = [0.7e6, 0.65e6, 0.6e6, 0.55e6, 0.55e6, 0.5e6, 0.5e6, 0.5e6]
+    if supply_bar:                                            # 回調中途出現放量長陰（供應擴大）
+        b.path(3, 126.0, 0.014, 0.4, vols[:3])
+        m["supply"] = b.bar(121.0, 0.045, 0.1, 2.8e6)
+        b.path(4, pb_end, 0.014, 0.4, vols[4:])
+    else:
+        b.path(8, pb_end, 0.014, 0.4, vols)
+    m["trigger"] = b.bar(trigger_close, 0.008, 0.45, 0.4e6)
+    for c, sp, cp, v in ((trigger_close + 2, 0.02, 0.8, 1.1e6), (trigger_close + 4, 0.025, 0.85, 1.3e6),
+                         (trigger_close + 6, 0.025, 0.85, 1.4e6)):
+        b.bar(c, sp, cp, v)
+    b.path(25, trigger_close + 23, 0.02, 0.6, 1.2e6, wiggle=0.004)
+    return b.df(), m
+
+
+def make_corner():
+    """下跌 → PS/SC → AR → ST → 區間震盪 → 在區間下半部收斂成死角（量縮、上漲K量大於下跌K）→ 向上突破"""
+    b = Builder(100.0)
+    rng = np.random.default_rng(7)
+    b.path(80, 110, 0.02, 0.55, list(1e6 * (1 + 0.05 * rng.standard_normal(80))), wiggle=0.01)
+    b.path(70, 75, 0.02, 0.45, 1e6)
+    b.path(5, b.last * 0.92, 0.025, 0.35, [1.2e6, 1.3e6, 1.35e6, 1.4e6, 1.45e6])
+    b.bar(b.last * 0.96, 0.065, 0.45, 3.6e6)
+    sc_low = b.rows[-1]["low"]
+    b.path(7, b.last * 1.13, 0.025, 0.7, [1.6e6, 1.4e6, 1.2e6, 1.1e6, 1.0e6, 0.9e6, 0.9e6])
+    res = max(r["high"] for r in b.rows[-8:])
+    b.path(8, sc_low * 1.02, 0.013, 0.45, [0.6e6] * 8)
+    h = res - sc_low
+    for k in range(1, 31):
+        b.bar(sc_low + h * (0.5 + 0.3 * np.sin(2 * np.pi * k / 15 - np.pi / 2)), 0.016, 0.5, 0.85e6 - k * 4000)
+    m = {"coil_start": len(b.rows)}
+    center = sc_low + 0.33 * h
+    for k in range(16):                                       # 振幅遞減、上漲K量略大於下跌K
+        amp = h * 0.16 * (1 - k / 16)
+        up = k % 2 == 0
+        b.bar(center + (amp if up else -amp) * 0.5, (0.018 if up else 0.014) * (1 - 0.8 * k / 16), 0.62 if up else 0.55,
+              (0.5e6 if up else 0.4e6) * (1 - 0.3 * k / 16))
+    m["coil_end"] = len(b.rows) - 1
+    b.path(6, res * 1.03, 0.03, 0.8, [1.8e6, 2.0e6, 2.1e6, 1.9e6, 1.5e6, 1.3e6])
+    b.path(20, res * 1.10, 0.02, 0.6, 1.1e6)
+    return b.df(), m
+
+
+class TestPullbackAndCorner(unittest.TestCase):
+    def test_pullback_signal_and_stop(self):
+        df, m = make_bull_pullback()
+        sc = WyckoffScanner(df).run()
+        s = sc.signals_df()
+        pb = s[(s["kind"] == "L_PULLBACK") & s["idx"].between(m["top"] + 2, m["trigger"])]
+        self.assertFalse(pb.empty, "多頭縮量回調後的停止行為未產生 L_PULLBACK")
+        last = pb.iloc[-1]
+        self.assertEqual(int(last["idx"]), m["trigger"])
+        self.assertLess(last["stop"], df.at[m["trigger"], "low"], "停損應在觸發K線低點之下")
+        t = backtest(sc)
+        self.assertTrue((t["kind"] == "L_PULLBACK").any())
+
+    def test_pullback_rejected_when_too_deep_or_supply(self):
+        for kwargs in (dict(pb_end=111.0, trigger_close=110.0), dict(supply_bar=True)):
+            df, m = make_bull_pullback(**kwargs)
+            s = WyckoffScanner(df).run().signals_df()
+            if "supply" in m:
+                start = m["supply"]
+            else:                                              # 第一根跌破上漲腿 50% 的 K 線
+                hh = df["high"].iloc[m["top"] - 5:m["top"] + 1].max()
+                base = df["low"].iloc[:m["top"]].iloc[-60:].min()
+                below = np.where(df["low"].to_numpy() < hh - 0.5 * (hh - base))[0]
+                start = int(below[below > m["top"]][0])
+            bad = s[(s["kind"] == "L_PULLBACK") & s["idx"].between(start, m["trigger"])]
+            self.assertTrue(bad.empty, f"{kwargs}：回調過深（>50%）或回調中出現供應時不應進場〔p28、p143〕")
+
+    def test_dead_corner_signal(self):
+        df, m = make_corner()
+        sc = WyckoffScanner(df).run()
+        s = sc.signals_df()
+        hit = s[(s["kind"] == "L_CORNER") & s["idx"].between(m["coil_start"], m["coil_end"])]
+        self.assertFalse(hit.empty, "需求背景下的死角未產生 L_CORNER")
+        self.assertTrue((hit["stop"] < df["low"].iloc[m["coil_start"]:m["coil_end"] + 1].max()).all())
+
+
+class TestExitsAndWaves(unittest.TestCase):
+    def test_no_demand_rally_after_trendline_break(self):
+        df, m = make_channel_series()
+        s = WyckoffScanner(df).run().signals_df()
+        a, z = m["break_dn"]
+        self.assertTrue(((s["kind"] == "S_NODEMAND") & s["idx"].between(a, z + 15)).any(), "跌破需求線後的無需求反彈未偵測")
+
+    def test_wave_stall_up(self):
+        n = 130
+        df = pd.DataFrame(dict(date=pd.bdate_range("2021-01-04", periods=n), open=100.0, high=101.0, low=99.0,
+                               close=100.0, volume=1e6))
+        df.loc[101:115, "volume"] = 3e6                        # 最後一個上漲波大量
+        d = add_features(df)
+        d["regime"] = "up"
+        piv = [dict(idx=10, price=90, kind="L", confirm=12), dict(idx=30, price=110, kind="H", confirm=32),
+               dict(idx=40, price=100, kind="L", confirm=42), dict(idx=60, price=120, kind="H", confirm=62),
+               dict(idx=70, price=108, kind="L", confirm=72), dict(idx=90, price=125, kind="H", confirm=92),
+               dict(idx=100, price=112, kind="L", confirm=102), dict(idx=115, price=122, kind="H", confirm=117)]
+        ev = wave_events(d, piv)
+        self.assertEqual([e["kind"] for e in ev], ["WAVE_STALL_UP"])
+        self.assertEqual(ev[0]["confirm"], 117)
+
+    def _uptrend(self, n=160):
+        c = 100 * 1.01 ** np.arange(n)
+        df = pd.DataFrame(dict(date=pd.bdate_range("2021-01-04", periods=n), open=c / 1.01, high=c * 1.0075,
+                               low=c * 0.9925, close=c, volume=1e6))
+        return df
+
+    def test_exit_on_sot_and_retracement(self):
+        df = self._uptrend()
+        sc = WyckoffScanner(df)
+        e = 80
+        sc.signals = [dict(idx=e, date=df.at[e, "date"], kind="L_LPS", side="long", stop=float(df.at[e, "close"] * 0.5),
+                           note="", page="", tr_id=-1),
+                      dict(idx=e + 10, date=df.at[e + 10, "date"], kind="W_SOT_up", side="warn", stop=NaN, note="", page="", tr_id=-1),
+                      dict(idx=e + 15, date=df.at[e + 15, "date"], kind="W_RETR_GT50", side="warn", stop=NaN, note="", page="", tr_id=-1)]
+        t = backtest(sc)
+        self.assertEqual(len(t), 1)
+        self.assertIn("SOT", t.at[0, "reason"])
+        self.assertEqual(str(t.at[0, "exit_date"])[:10], str(df.at[e + 16, "date"])[:10])
+
+    def test_exit_on_volume_stall(self):
+        df = self._uptrend()
+        k = 100                                                # 放量滯漲：量增、振幅縮小；次日量縮
+        df.loc[k, ["high", "low", "volume"]] = [df.at[k, "close"] * 1.002, df.at[k, "close"] * 0.998, 1.5e6]
+        df.loc[k + 1, "volume"] = 0.5e6
+        sc = WyckoffScanner(df)
+        self.assertTrue(bool(sc.s.at[k, "stop2_up"]))
+        e = 80
+        sc.signals = [dict(idx=e, date=df.at[e, "date"], kind="L_LPS", side="long", stop=float(df.at[e, "close"] * 0.5),
+                           note="", page="", tr_id=-1)]
+        t = backtest(sc)
+        self.assertIn("放量滯漲", t.at[0, "reason"])
+        self.assertEqual(str(t.at[0, "exit_date"])[:10], str(df.at[k + 1, "date"])[:10])
+
+
+class TestSelectionAndSizing(unittest.TestCase):
+    def test_relative_strength(self):
+        n = 121
+        x = np.arange(n)
+        idx_close = np.interp(x, [0, 80, 120], [100, 70, 90])            # 大盤：一路跌到第 80 根創新低，之後反彈
+        stk_close = np.interp(x, [0, 20, 60, 80, 120], [100, 95, 104, 101, 135])
+        mk = lambda cl: pd.DataFrame(dict(date=pd.bdate_range("2022-01-03", periods=n), high=cl * 1.005, low=cl * 0.995, close=cl))
+        rs = relative_strength(mk(stk_close), mk(idx_close))
+        self.assertTrue(bool(rs.at[80, "rs_divergence"]), "大盤創新低、個股未創新低且回調未過 50% 應判定為強勢〔p253〕")
+        self.assertGreater(rs.at[n - 1, "rs_out"], 0)
+        self.assertTrue(bool(rs.at[n - 1, "rs_strong"]))
+
+    def test_position_size(self):
+        r = position_size(1_000_000, 100, 95, risk_pct=0.01)
+        self.assertEqual(r["shares"], 1797)
+        self.assertLessEqual(r["risk_amount"], 10_000)
+        self.assertEqual(position_size(1_000_000, 100, 95, risk_pct=0.01, allow_odd_lot=False)["shares"], 1000)
+        self.assertEqual(position_size(1_000_000, 100, 101)["shares"], 0)
 
 
 class TestCsvLoader(unittest.TestCase):

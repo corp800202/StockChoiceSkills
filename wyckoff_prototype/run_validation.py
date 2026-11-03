@@ -40,7 +40,7 @@ import numpy as np
 import pandas as pd
 
 from wyckoff_engine import (Params, WyckoffScanner, backtest, summarize_trades, event_study,
-                            snapshot, audit_trades, load_ohlcv_csv)
+                            snapshot, audit_trades, load_ohlcv_csv, relative_strength, LONG_KINDS)
 
 # 單變數敏感度（只調整【參數】類門檻）
 SENS_GRID = {
@@ -100,7 +100,7 @@ def random_baseline(sc: WyckoffScanner, n_trades: int, stop_atr: float, reps: in
     orig = sc.signals
     for _ in range(reps):
         picks = np.sort(rng.choice(valid, size=n_trades, replace=False))
-        fake = [s for s in orig if s["kind"] not in ("L_SPRING", "L_TEST", "L_LPS", "L_BU")]
+        fake = [s for s in orig if s["kind"] not in LONG_KINDS]
         for i in picks:
             fake.append(dict(idx=int(i), date=d.at[i, "date"], kind="L_RANDOM", side="long",
                              stop=float(d.at[i, "close"] - stop_atr * d.at[i, "atr"]), note="", page="", tr_id=-1))
@@ -111,20 +111,6 @@ def random_baseline(sc: WyckoffScanner, n_trades: int, stop_atr: float, reps: in
     sc.signals = orig
     return dict(rand_avg_net_mean=float(np.mean(exp)) if exp else math.nan,
                 rand_avg_net_p95=float(np.percentile(exp, 95)) if exp else math.nan)
-
-
-def relative_strength(stock: pd.DataFrame, index: pd.DataFrame, lookback: int = 60) -> pd.DataFrame:
-    """原書相對強弱〔p253-258〕：大盤創新低時個股沒有創新低、回調未過 50%；大盤回升時漲幅更大。"""
-    m = stock[["date", "close", "high", "low"]].merge(index[["date", "close", "low"]], on="date", suffixes=("", "_idx"))
-    m["rs"] = m["close"] / m["close_idx"]
-    m["idx_new_low"] = m["low_idx"] <= m["low_idx"].rolling(lookback).min()
-    m["stk_new_low"] = m["low"] <= m["low"].rolling(lookback).min()
-    hh = m["high"].rolling(lookback).max()
-    ll = m["low"].rolling(lookback).min()
-    m["stk_retr"] = (hh - m["close"]) / (hh - ll)
-    m["rs_divergence"] = m["idx_new_low"] & ~m["stk_new_low"] & (m["stk_retr"] < 0.5)
-    m["rs_score_60"] = m["rs_divergence"].rolling(lookback).sum()
-    return m
 
 
 def run_one(sym: str, df: pd.DataFrame, out: str, p: Params, index_df=None, trades_df=None, split=None,
@@ -140,7 +126,7 @@ def run_one(sym: str, df: pd.DataFrame, out: str, p: Params, index_df=None, trad
     t.to_csv(f"{out}/trades.csv", index=False, encoding="utf-8-sig")
     event_study(sc).to_csv(f"{out}/event_study.csv", index=False, encoding="utf-8-sig")
     with open(f"{out}/card.json", "w", encoding="utf-8") as f:
-        json.dump(snapshot(sc, symbol=sym), f, ensure_ascii=False, indent=2, default=str)
+        json.dump(snapshot(sc, symbol=sym, index_df=index_df), f, ensure_ascii=False, indent=2, default=str)
     res = dict(symbol=sym, bars=len(df), start=str(df["date"].iloc[0])[:10], end=str(df["date"].iloc[-1])[:10],
                n_tr=len(trs), n_events=len(ev), n_trades=len(t),
                buy_hold=float(df["close"].iloc[-1] / df["close"].iloc[0] - 1))
@@ -166,7 +152,8 @@ def run_one(sym: str, df: pd.DataFrame, out: str, p: Params, index_df=None, trad
     if index_df is not None:
         rs = relative_strength(df, index_df)
         rs.to_csv(f"{out}/relative_strength.csv", index=False, encoding="utf-8-sig")
-        res["rs_score_60_last"] = float(rs["rs_score_60"].iloc[-1]) if len(rs) else math.nan
+        res["rs_score_last"] = float(rs["rs_score"].iloc[-1]) if len(rs) else math.nan
+        res["rs_strong_last"] = bool(rs["rs_strong"].iloc[-1]) if len(rs) else False
     if trades_df is not None:
         tt = trades_df if "symbol" not in trades_df else trades_df[trades_df["symbol"].astype(str) == str(sym)]
         if len(tt):
