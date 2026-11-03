@@ -378,7 +378,7 @@ class TestWeeklyAndPnf(unittest.TestCase):
 
 
 def make_bull_pullback(pb_end=118.0, trigger_close=117.0, supply_bar=False):
-    """暖身 → 垂直需求柱 → 上漲腿 → 縮量小蠟燭回調 → 停止行為 → 續漲（書中最小可行系統的情境〔p316〕）"""
+    """暖身 → 垂直需求柱 → 上漲腿 → 縮量小蠟燭回調 → 停止行為 → 續漲（書中後記推薦的牛市回調情境〔p316〕）"""
     b = Builder(100.0)
     rng = np.random.default_rng(3)
     b.path(70, 100.0, 0.02, 0.5, list(1e6 * (1 + 0.05 * rng.standard_normal(70))), wiggle=0.01, period=12)

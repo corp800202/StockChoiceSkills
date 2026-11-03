@@ -101,7 +101,7 @@ class Params:
     # 多時間框架：由日 K 合成週 K 作為大背景〔p31、p127、p146、p268–272〕
     use_weekly: bool = True
     weekly_filter: bool = False      # True：週線仍在下跌且尚未形成區間時，不採用日線多方訊號〔p147、p225〕
-    # v1.2：趨勢回調進場（書中的「最小可行系統」〔p316〕：牛市＋需要的回調＋停止行為扣扳機）
+    # v1.2：趨勢回調進場（書中後記推薦的入門方法〔p316〕：牛市＋需要的回調＋停止行為扣扳機）
     pb_lookback: int = 40            # 近 40 根最高點視為這一波的高點【延伸】
     pb_min_leg_atr: float = 3.0      # 上漲腿至少 3 ATR 才算一波【延伸】
     pb_max_retr: float = 0.5         # 【原書 p143–146、p187】回調不超過上漲腿 50%
@@ -1243,7 +1243,7 @@ class WyckoffScanner:
             elif k == "SOT_CH_UP":
                 self._sig(i, "W_SOT_CH", "warn", NaN, e["note"], e["page"], tr)
 
-    # ---------------- v1.2：趨勢回調進場（書中的最小可行系統〔p316〕）----------------
+    # ---------------- v1.2：趨勢回調進場（書中後記推薦的入門方法〔p316〕）----------------
     def _pullback_pass(self):
         """牛市回調進場，不需要先有交易區間。全部只用當根以前的資料。
 
@@ -1317,7 +1317,7 @@ class WyckoffScanner:
                 zones.append(("需求線（上升趨勢線）", lv - z, lv + z, lv - 0.5 * a, "p269-270"))
             mid = hh - 0.5 * leg
             zones.append(("上漲腿 50% 位置", mid - z, mid + z, None, "p143-146,p239-240"))
-            # 原書最小可行系統〔p316〕不要求特定支撐；回調在 25%～50% 之間即屬健康回調〔p143–146〕
+            # 原書後記的牛市回調方法〔p316〕不要求特定支撐；回調在 25%～50% 之間即屬健康回調〔p143–146〕
             zones.append(("健康回調區（上漲腿 25%～50%）", hh - 0.5 * leg, hh - 0.25 * leg, None, "p143-146,p316"))
             sot = l[i] < l[i - 1] < l[i - 2] and (l[i - 1] - l[i]) <= 0.5 * (l[i - 2] - l[i - 1]) and rvol[i] <= 1.0
             hit = None
@@ -1443,7 +1443,7 @@ class WyckoffScanner:
                                     price=w["price"], tr_id=-1, note=w["note"], page=w["page"]))
             if w["kind"] == "WAVE_STALL_UP":
                 self._sig(w["confirm"], "W_WAVE_STALL_UP", "warn", NaN, w["note"], w["page"], tr_id=-1)
-        # v1.2：不依賴交易區間的進場（書中的最小可行系統、死角交易法）
+        # v1.2：不依賴交易區間的進場（書中後記推薦的牛市回調、死角交易法）
         self._pullback_pass()
         self._corner_pass()
         return self
@@ -1792,7 +1792,7 @@ def audit_trades(sc: WyckoffScanner, trades: pd.DataFrame) -> pd.DataFrame:
             if (just & {"Spring", "Test", "LPS", "BU"}) and not joc_today:
                 flags.append("✔ 買在原書進場點（Spring/測試/LPS/回測後 0~2 根）")
             if just & {"PB", "CORNER"}:
-                flags.append("✔ 買在牛市回調的停止行為或死角（原書最小可行系統〔p316〕、死角交易法〔p114〕）")
+                flags.append("✔ 買在牛市回調的停止行為或死角（原書後記推薦的牛市回調〔p316〕、死角交易法〔p114〕）")
             if ph == "B":
                 flags.append("✘ 在震盪區內部買進（原書：風險最大〔p93〕）")
             if joc_today:
